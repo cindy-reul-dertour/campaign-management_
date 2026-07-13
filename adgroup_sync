@@ -1,43 +1,51 @@
-WITH stats AS (      
+WITH gads AS (
   SELECT
-    ad_group_id,
-    SUM(metrics_cost_micros) / 1000000 AS cost_30d,   -- micros -> Euro
-    SUM(metrics_conversions)           AS conversions_30d
-  FROM `dt-dertour-digital-marketing.google_ads_daten_powerbi.ads_AdGroupBasicStats_5551209914`
-  WHERE _DATA_DATE BETWEEN DATE_SUB(CURRENT_DATE(), INTERVAL 30 DAY)
-                       AND DATE_SUB(CURRENT_DATE(), INTERVAL 1 DAY)
-    AND customer_id = 8009023176
-  GROUP BY ad_group_id
+    ad_group_name                                          AS adgroup_name,
+    CAST(ad_group_id AS STRING)                            AS adgroup_id,
+    -- customer_id ist hier schon reine Zahl; REPLACE bleibt sicherheitshalber drin
+    REPLACE(CAST(customer_id AS STRING), '-', '')          AS customer_id,
+    campaign_name,
+    CAST(campaign_id AS STRING)                            AS campaign_id,
+    SAFE_CAST(cost_30d AS FLOAT64)                         AS cost,
+    -- GIATA-ID = 9. Teil des Namens -> SAFE_OFFSET(8)
+    SAFE_CAST(SPLIT(ad_group_name, '_')[SAFE_OFFSET(8)] AS INT64) AS giata_id
+  FROM `dt-dertour-digital-marketing.sea_automation_prod.dertour_google_adgroup-sync_30`
 ),
-
-adgroups AS (
-  SELECT ad_group_id, ad_group_name, ad_group_status, campaign_id, customer_id
-  FROM `dt-dertour-digital-marketing.google_ads_daten_powerbi.ads_AdGroup_5551209914`
-  WHERE _DATA_DATE = _LATEST_DATE
-    AND customer_id = 8009023176
+adobe7 AS (
+  SELECT
+    SAFE_CAST(giata_id AS INT64) AS giata_id,
+    SAFE_CAST(orders   AS INT64) AS orders_7
+  FROM `dt-dertour-digital-marketing.adobe_analytics.adobe_dertour_giata-id-bookings_7`
 ),
-
-campaigns AS (
-  SELECT campaign_id, campaign_name, campaign_advertising_channel_type, campaign_status
-  FROM `dt-dertour-digital-marketing.google_ads_daten_powerbi.ads_Campaign_5551209914`
-  WHERE _DATA_DATE = _LATEST_DATE
-    AND customer_id = 8009023176
+adobe30 AS (
+  SELECT
+    SAFE_CAST(giata_id AS INT64) AS giata_id,
+    SAFE_CAST(orders   AS INT64) AS orders_30
+  FROM `dt-dertour-digital-marketing.adobe_analytics.adobe_dertour_giata-id-bookings_30`
+),
+joined AS (
+  SELECT
+    g.*,
+    COALESCE(a7.orders_7,   0) AS orders_7,   -- kein Adobe-Treffer = 0 Buchungen
+    COALESCE(a30.orders_30, 0) AS orders_30
+  FROM gads g
+  LEFT JOIN adobe7  a7  ON g.giata_id = a7.giata_id
+  LEFT JOIN adobe30 a30 ON g.giata_id = a30.giata_id
 )
-
 SELECT
-  a.ad_group_name,
-  a.ad_group_id,
-  a.ad_group_status,
-  c.campaign_name,
-  a.campaign_id,
-  a.customer_id,
-  IFNULL(s.cost_30d, 0)        AS cost_30d,
-  IFNULL(s.conversions_30d, 0) AS conversions_30d
-FROM adgroups a
-JOIN campaigns c USING (campaign_id)
-LEFT JOIN stats s USING (ad_group_id)
-WHERE c.campaign_advertising_channel_type = 'SEARCH'
-  AND REGEXP_CONTAINS(c.campaign_name, r'_Hotelnamen_')
-  AND NOT REGEXP_CONTAINS(a.ad_group_name, r'_Generic_')
-  AND a.ad_group_status != 'REMOVED'
-  AND c.campaign_status = 'ENABLED'
+  adgroup_name,
+  adgroup_id,
+  customer_id,
+  campaign_name,
+  campaign_id,
+  giata_id,
+  cost,
+  orders_7,
+  orders_30,
+  CASE
+    WHEN cost < 10   AND orders_7  >= 1 THEN 'ENABLE'
+    WHEN cost > 1000 AND orders_30 <= 0 THEN 'PAUSE'
+    ELSE 'NO_CHANGE'
+  END AS action
+FROM joined
+ORDER BY action
