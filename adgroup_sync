@@ -1,0 +1,43 @@
+WITH stats AS (      
+  SELECT
+    ad_group_id,
+    SUM(metrics_cost_micros) / 1000000 AS cost_30d,   -- micros -> Euro
+    SUM(metrics_conversions)           AS conversions_30d
+  FROM `dt-dertour-digital-marketing.google_ads_daten_powerbi.ads_AdGroupBasicStats_5551209914`
+  WHERE _DATA_DATE BETWEEN DATE_SUB(CURRENT_DATE(), INTERVAL 30 DAY)
+                       AND DATE_SUB(CURRENT_DATE(), INTERVAL 1 DAY)
+    AND customer_id = 8009023176
+  GROUP BY ad_group_id
+),
+
+adgroups AS (
+  SELECT ad_group_id, ad_group_name, ad_group_status, campaign_id, customer_id
+  FROM `dt-dertour-digital-marketing.google_ads_daten_powerbi.ads_AdGroup_5551209914`
+  WHERE _DATA_DATE = _LATEST_DATE
+    AND customer_id = 8009023176
+),
+
+campaigns AS (
+  SELECT campaign_id, campaign_name, campaign_advertising_channel_type, campaign_status
+  FROM `dt-dertour-digital-marketing.google_ads_daten_powerbi.ads_Campaign_5551209914`
+  WHERE _DATA_DATE = _LATEST_DATE
+    AND customer_id = 8009023176
+)
+
+SELECT
+  a.ad_group_name,
+  a.ad_group_id,
+  a.ad_group_status,
+  c.campaign_name,
+  a.campaign_id,
+  a.customer_id,
+  IFNULL(s.cost_30d, 0)        AS cost_30d,
+  IFNULL(s.conversions_30d, 0) AS conversions_30d
+FROM adgroups a
+JOIN campaigns c USING (campaign_id)
+LEFT JOIN stats s USING (ad_group_id)
+WHERE c.campaign_advertising_channel_type = 'SEARCH'
+  AND REGEXP_CONTAINS(c.campaign_name, r'_Hotelnamen_')
+  AND NOT REGEXP_CONTAINS(a.ad_group_name, r'_Generic_')
+  AND a.ad_group_status != 'REMOVED'
+  AND c.campaign_status = 'ENABLED'
