@@ -1,0 +1,3 @@
+functions-framework>=3,<4
+google-cloud-bigquery>=3.20,<4
+google-ads==31.1.0
