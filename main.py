@@ -19,7 +19,7 @@ SCOPES = [
 
 
 def get_decisions():
-    """Liest die Entscheidungen aus dem BigQuery-View."""
+    """Read BQ view."""
     credentials, _ = google.auth.default(scopes=SCOPES)
     client = bigquery.Client(project=PROJECT_ID, credentials=credentials)
     query = f"""
@@ -31,7 +31,7 @@ def get_decisions():
 
 
 def build_ads_client():
-    """Baut den Google-Ads-Client aus den Secrets"""
+    """secret manager data"""
     config = {
         "developer_token": os.environ["GOOGLE_ADS_DEVELOPER_TOKEN"],
         "client_id": os.environ["GOOGLE_ADS_CLIENT_ID"],
@@ -44,7 +44,7 @@ def build_ads_client():
 
 
 def apply_change(ads_client, customer_id, ad_group_id, action):
-    """Schaltet eine einzelne Anzeigengruppe auf ENABLED oder PAUSED."""
+    """adgroup sync logic based on BQ view."""
     service = ads_client.get_service("AdGroupService")
     operation = ads_client.get_type("AdGroupOperation")
     ad_group = operation.update
