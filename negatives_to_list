@@ -1,0 +1,250 @@
+/**
+ * last update: 29.07.26, CR
+ * version: 1.3
+ *
+ * Change 1.3: Performance - source keywords are now read with a single GAQL
+ *             query per account (AdsApp.search) instead of iterating campaign
+ *             and keyword entities; all source accounts are resolved in one
+ *             lookup; removed the redundant SpreadsheetApp.flush()
+ * Change 1.2: Script setup to MCC level and MCC negative list
+ *
+ * Collects active keywords from configured campaigns (competitors) across several accounts
+ * and syncs them into a negative keyword list on MCC level (broad match) to assign to PMAX campaigns
+ * Every change is logged as a row in a Google Sheet.
+ *
+ */
+
+// ==================== CONFIGURATION ====================
+
+var SOURCES = [
+  { accountId: '821-278-8054', campaignIds: [23852264158] }, //campaignIds: [11111111111, 22222222222] }
+];
+
+// 'PAUSED' | 'ENABLED' | null (= any status except REMOVED)
+var CAMPAIGN_STATUS = 'ENABLED';
+
+// Exact name of the negative keyword list on MCC level
+var LIST_NAME = 'testing_negatives_script';
+
+// --- Sheet ---
+var SPREADSHEET_URL = 'https://docs.google.com/spreadsheets/d/1midwBxOMScvRh-cs-vFHe9wJ3HTyh1ezrvrggoUGJMw/edit?gid=0#gid=0';
+var SHEET_NAME = 'competitors';   // created if it does not exist
+var LOG_NO_CHANGES = true;        // write a "keine Änderung" row when nothing changed
+
+// Safety net: abort if fewer than X source keywords are found
+// (prevents the list from being wiped on a misconfiguration).
+var MIN_SOURCE_KEYWORDS = 1;
+
+var DRY_RUN = true;              // true = change nothing, write nothing
+
+// =======================================================
+
+function main() {
+  // Remember the MCC context so we can return after switching accounts.
+  var managerAccount = AdsApp.currentAccount();
+
+  // --- Phase 1: collect keywords from all source accounts ---
+  var targetKeywords = collectSourceKeywords_();
+
+  // --- Phase 2: switch back to the MCC context ---
+  AdsManagerApp.select(managerAccount);
+
+  if (countKeys_(targetKeywords) < MIN_SOURCE_KEYWORDS) {
+    throw new Error('Aborted: only ' + countKeys_(targetKeywords) +
+                    ' source keywords found (minimum: ' + MIN_SOURCE_KEYWORDS +
+                    '). List left unchanged.');
+  }
+
+  // --- Phase 3: sync the MCC list ---
+  var list = getNegativeKeywordList_(LIST_NAME);
+  if (!list) {
+    throw new Error('Negative keyword list "' + LIST_NAME + '" not found in the MCC. ' +
+                    'Check that the list lives in the manager account and the name matches exactly.');
+  }
+
+  var currentEntries = getListEntries_(list);
+
+  // Missing in the list
+  var toAdd = [];
+  for (var key in targetKeywords) {
+    if (!currentEntries.hasOwnProperty(key)) {
+      toAdd.push(targetKeywords[key]);
+    }
+  }
+
+  // Obsolete in the list
+  var toRemove = [];
+  for (var key2 in currentEntries) {
+    if (!targetKeywords.hasOwnProperty(key2)) {
+      toRemove.push(currentEntries[key2]);
+    }
+  }
+
+  var date = Utilities.formatDate(new Date(),
+                                  managerAccount.getTimeZone(),
+                                  'dd.MM.yyyy');
+
+  // Nothing changed
+  if (!toAdd.length && !toRemove.length) {
+    if (LOG_NO_CHANGES && !DRY_RUN) {
+      writeToSheet_([[date, '', 'keine Änderung']]);
+    }
+    return;
+  }
+
+  if (DRY_RUN) {
+    Logger.log('DRY RUN - to add: ' + toAdd.length + ', to remove: ' + toRemove.length);
+    return;
+  }
+
+  var rows = [];
+
+  var CHUNK = 1000;
+  for (var i = 0; i < toAdd.length; i += CHUNK) {
+    list.addNegativeKeywords(toAdd.slice(i, i + CHUNK));
+  }
+  for (var a = 0; a < toAdd.length; a++) {
+    rows.push([date, toAdd[a], 'hinzugefügt']);
+  }
+
+  for (var r = 0; r < toRemove.length; r++) {
+    var text = stripMatchType_(toRemove[r].getText()).toLowerCase();
+    toRemove[r].remove();
+    rows.push([date, text, 'gelöscht']);
+  }
+
+  writeToSheet_(rows);
+}
+
+/**
+ * Switches into every source account and reads the active keywords of the
+ * configured campaigns with a single GAQL query per account.
+ * Returns: { normalizedText: rawText } across all accounts.
+ */
+function collectSourceKeywords_() {
+  var result = {};
+  var accounts = resolveAccounts_();
+
+  for (var s = 0; s < SOURCES.length; s++) {
+    var source = SOURCES[s];
+    var accountId = String(source.accountId).replace(/-/g, '');
+
+    if (!accounts[accountId]) {
+      throw new Error('Account ' + source.accountId + ' not found or not linked to this MCC.');
+    }
+    AdsManagerApp.select(accounts[accountId]);
+
+    var rows = AdsApp.search(buildKeywordQuery_(source.campaignIds));
+    while (rows.hasNext()) {
+      var raw = stripMatchType_(rows.next().adGroupCriterion.keyword.text);
+      var key = normalize_(raw);
+      if (key) {
+        result[key] = raw.toLowerCase();
+      }
+    }
+  }
+
+  return result;
+}
+
+/** Resolves all configured source accounts in one lookup. */
+function resolveAccounts_() {
+  var ids = [];
+  for (var s = 0; s < SOURCES.length; s++) {
+    ids.push(String(SOURCES[s].accountId).replace(/-/g, ''));
+  }
+
+  var accounts = {};
+  var it = AdsManagerApp.accounts().withIds(ids).get();
+  while (it.hasNext()) {
+    var account = it.next();
+    accounts[String(account.getCustomerId()).replace(/-/g, '')] = account;
+  }
+  return accounts;
+}
+
+/** Builds the GAQL query for one account. */
+function buildKeywordQuery_(campaignIds) {
+  var conditions = [
+    'ad_group_criterion.status = "ENABLED"',
+    'ad_group.status = "ENABLED"',
+    'ad_group_criterion.negative = FALSE'
+  ];
+
+  if (CAMPAIGN_STATUS) {
+    conditions.push('campaign.status = "' + CAMPAIGN_STATUS + '"');
+  } else {
+    conditions.push('campaign.status != "REMOVED"');
+  }
+
+  if (campaignIds && campaignIds.length) {
+    conditions.push('campaign.id IN (' + campaignIds.join(', ') + ')');
+  }
+
+  return 'SELECT ad_group_criterion.keyword.text ' +
+         'FROM keyword_view ' +
+         'WHERE ' + conditions.join(' AND ');
+}
+
+/** Appends rows at the bottom of the sheet, creates the header row if needed. */
+function writeToSheet_(rows) {
+  if (!rows.length) {
+    return;
+  }
+
+  var spreadsheet = SpreadsheetApp.openByUrl(SPREADSHEET_URL);
+  var sheet = spreadsheet.getSheetByName(SHEET_NAME);
+  if (!sheet) {
+    sheet = spreadsheet.insertSheet(SHEET_NAME);
+  }
+
+  if (sheet.getLastRow() === 0) {
+    sheet.getRange(1, 1, 1, 3)
+         .setValues([['Datum der Änderung', 'Keyword', 'Hinzugefügt/Gelöscht']])
+         .setFontWeight('bold');
+    sheet.setFrozenRows(1);
+  }
+
+  sheet.getRange(sheet.getLastRow() + 1, 1, rows.length, 3).setValues(rows);
+}
+
+/**
+ * Current entries of the negative keyword list.
+ * Returns: { normalizedText: SharedNegativeKeyword }
+ */
+function getListEntries_(list) {
+  var result = {};
+  var it = list.negativeKeywords().get();
+  while (it.hasNext()) {
+    var negative = it.next();
+    var key = normalize_(stripMatchType_(negative.getText()));
+    if (key) {
+      result[key] = negative;
+    }
+  }
+  return result;
+}
+
+function getNegativeKeywordList_(name) {
+  var it = AdsApp.negativeKeywordLists()
+      .withCondition('shared_set.name = "' + LIST_NAME + '"')
+      .get();
+  return it.hasNext() ? it.next() : null;
+}
+
+/** Strips [] and "" from the keyword notation. */
+function stripMatchType_(text) {
+  return String(text).replace(/^\s*[\[\"]?\s*/, '').replace(/\s*[\]\"]?\s*$/, '').trim();
+}
+
+/** Comparison key: lowercase, collapsed whitespace. */
+function normalize_(text) {
+  return String(text).toLowerCase().replace(/\s+/g, ' ').trim();
+}
+
+function countKeys_(obj) {
+  var n = 0;
+  for (var k in obj) { n++; }
+  return n;
+}
+
