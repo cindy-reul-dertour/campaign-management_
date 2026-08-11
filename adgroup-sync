@@ -1,0 +1,230 @@
+import os
+from datetime import datetime
+from zoneinfo import ZoneInfo
+
+import functions_framework
+import google.auth
+from google.cloud import bigquery
+from google.ads.googleads.client import GoogleAdsClient
+from google.api_core import protobuf_helpers
+from googleapiclient.discovery import build
+
+# --- Configuration ---------------------------------------------------
+PROJECT_ID = "dt-dertour-digital-marketing"
+VIEW = f"{PROJECT_ID}.sea_automation_prod.its_adgroup-sync_decision"
+
+# View with GIATA IDs that qualify but have no ad group yet
+NEW_VIEW = f"{PROJECT_ID}.sea_automation_prod.its_adgroup-sync_new-adgroups"
+
+# Reporting sheet "ITS_logs" for the SEA team.
+# One tab per application -- override via env variables if needed.
+SHEET_ID = "1HgY7V1EOAYmvHVrp1gW6_dI4Gfqpj9ynLgqsfoI1_R8"
+SHEET_TAB = os.environ.get("SHEET_TAB", "adgroup_sync")
+SHEET_TAB_DRY_RUN = os.environ.get("SHEET_TAB_DRY_RUN", "adgroup_sync_test")
+SHEET_TAB_NEW = os.environ.get("SHEET_TAB_NEW", "adgroups_new")
+
+# DRY_RUN=true  -> nothing is changed, actions are only logged (default, safe)
+# DRY_RUN=false -> changes are actually applied in the Google Ads account
+DRY_RUN = os.environ.get("DRY_RUN", "true").lower() != "false"
+
+# Google Sheet-backed BigQuery tables need the Drive scope in addition to BigQuery
+SCOPES = [
+    "https://www.googleapis.com/auth/drive",
+    "https://www.googleapis.com/auth/cloud-platform",
+]
+
+# Writing into the reporting sheet needs the Sheets scope
+SHEET_SCOPES = ["https://www.googleapis.com/auth/spreadsheets"]
+
+# Header of the adgroups_new tab
+NEW_HEADER = [
+    "giata_id",
+    "its_orders_30",
+    "its_rpo_30",
+    "dertour_orders_30",
+    "dertour_rpo_30",
+    "reason",
+]
+
+
+def get_decisions():
+    # Read the ENABLE/PAUSE decisions from the BigQuery view.
+    # Ad groups already in the target status are skipped -> no pointless API calls.
+    credentials, _ = google.auth.default(scopes=SCOPES)
+    client = bigquery.Client(project=PROJECT_ID, credentials=credentials)
+    query = f"""
+        SELECT adgroup_id, adgroup_name, customer_id, adgroup_status, action
+        FROM `{VIEW}`
+        WHERE (action = 'ENABLE' AND adgroup_status != 'ENABLED')
+           OR (action = 'PAUSE'  AND adgroup_status != 'PAUSED')
+    """
+    return list(client.query(query).result())
+
+
+def get_new_adgroups():
+    # Read the GIATA IDs that qualify but do not have an ad group yet
+    credentials, _ = google.auth.default(scopes=SCOPES)
+    client = bigquery.Client(project=PROJECT_ID, credentials=credentials)
+    query = f"""
+        SELECT giata_id, its_orders_30, its_rpo_30,
+               dertour_orders_30, dertour_rpo_30, reason
+        FROM `{NEW_VIEW}`
+        ORDER BY its_orders_30 DESC, dertour_orders_30 DESC
+    """
+    return list(client.query(query).result())
+
+
+def cell(value):
+    # Make a BigQuery value safe for the Sheets API
+    if value is None:
+        return ""
+    if isinstance(value, float):
+        return round(value, 2)
+    return value
+
+
+def append_to_sheet(rows, tab):
+    # Append one row per change to the given tab of the reporting sheet
+    credentials, _ = google.auth.default(scopes=SHEET_SCOPES)
+    service = build("sheets", "v4", credentials=credentials)
+    service.spreadsheets().values().append(
+        spreadsheetId=SHEET_ID,
+        range=f"{tab}!A:C",
+        valueInputOption="USER_ENTERED",
+        insertDataOption="INSERT_ROWS",
+        body={"values": rows},
+    ).execute()
+
+
+def overwrite_sheet(rows, tab, last_col):
+    # Replace the whole tab content -- used for the current suggestion list
+    credentials, _ = google.auth.default(scopes=SHEET_SCOPES)
+    service = build("sheets", "v4", credentials=credentials)
+    service.spreadsheets().values().clear(
+        spreadsheetId=SHEET_ID,
+        range=f"{tab}!A:{last_col}",
+    ).execute()
+    service.spreadsheets().values().update(
+        spreadsheetId=SHEET_ID,
+        range=f"{tab}!A1",
+        valueInputOption="USER_ENTERED",
+        body={"values": rows},
+    ).execute()
+
+
+def build_ads_client():
+    # Build the Google Ads client from the secrets (provided as env variables)
+    config = {
+        "developer_token": os.environ["GOOGLE_ADS_DEVELOPER_TOKEN"],
+        "client_id": os.environ["GOOGLE_ADS_CLIENT_ID"],
+        "client_secret": os.environ["GOOGLE_ADS_CLIENT_SECRET"],
+        "refresh_token": os.environ["GOOGLE_ADS_REFRESH_TOKEN"],
+        "login_customer_id": os.environ["GOOGLE_ADS_LOGIN_CUSTOMER_ID"],
+        "use_proto_plus": True,
+    }
+    return GoogleAdsClient.load_from_dict(config)
+
+
+def apply_change(ads_client, customer_id, ad_group_id, action):
+    # Set a single ad group to ENABLED or PAUSED via the Google Ads API
+    service = ads_client.get_service("AdGroupService")
+    operation = ads_client.get_type("AdGroupOperation")
+    ad_group = operation.update
+    ad_group.resource_name = service.ad_group_path(customer_id, ad_group_id)
+
+    # Choose the target status based on the action
+    ad_group.status = (
+        ads_client.enums.AdGroupStatusEnum.ENABLED
+        if action == "ENABLE"
+        else ads_client.enums.AdGroupStatusEnum.PAUSED
+    )
+
+    # Update mask: tell the API that only the status field changes
+    ads_client.copy_from(
+        operation.update_mask,
+        protobuf_helpers.field_mask(None, ad_group._pb),
+    )
+    service.mutate_ad_groups(customer_id=customer_id, operations=[operation])
+
+
+def report_new_adgroups():
+    # Pure reporting: reads BigQuery, writes the sheet, never touches the account.
+    # Runs regardless of DRY_RUN because it cannot change anything.
+    new_rows = get_new_adgroups()
+    values = [NEW_HEADER] + [
+        [
+            cell(r.giata_id),
+            cell(r.its_orders_30),
+            cell(r.its_rpo_30),
+            cell(r.dertour_orders_30),
+            cell(r.dertour_rpo_30),
+            cell(r.reason),
+        ]
+        for r in new_rows
+    ]
+    overwrite_sheet(values, SHEET_TAB_NEW, "F")
+    return len(new_rows)
+
+
+@functions_framework.http
+def sync_adgroups(request):
+    # Entry point: fetch decisions, then apply them (or log them in dry run)
+    decisions = get_decisions()
+    print(f"{len(decisions)} ad group(s) to change. DRY_RUN={DRY_RUN}")
+
+    # Only build the Ads client when we actually apply changes
+    ads_client = None if (DRY_RUN or not decisions) else build_ads_client()
+
+    today = datetime.now(ZoneInfo("Europe/Berlin")).strftime("%d/%m/%Y")
+    sheet_rows = []
+    done = 0
+    failed = 0
+
+    for row in decisions:
+        info = (
+            f"{row.action}: adgroup {row.adgroup_id} "
+            f"(account {row.customer_id}, currently {row.adgroup_status})"
+        )
+        label = "aktiviert" if row.action == "ENABLE" else "pausiert"
+
+        if DRY_RUN:
+            # Dry run: log only, but still collect the rows so the sheet can be tested
+            print(f"[DRY_RUN] would do -> {info}")
+            sheet_rows.append([today, row.adgroup_name, label])
+        else:
+            # Live: apply the status change, but keep going if one ad group fails
+            try:
+                apply_change(ads_client, row.customer_id, row.adgroup_id, row.action)
+                print(f"[LIVE] done -> {info}")
+                done += 1
+                sheet_rows.append([today, row.adgroup_name, label])
+            except Exception as error:
+                failed += 1
+                print(f"[ERROR] failed -> {info} | {error}")
+
+    # Report the changes; a failing sheet must not fail the whole run.
+    # Dry runs go to the test tab so the real report stays clean.
+    if sheet_rows:
+        tab = SHEET_TAB_DRY_RUN if DRY_RUN else SHEET_TAB
+        try:
+            append_to_sheet(sheet_rows, tab)
+            print(f"Sheet tab '{tab}' updated with {len(sheet_rows)} row(s).")
+        except Exception as error:
+            print(f"[ERROR] sheet update failed | {error}")
+
+    # Second, independent part: suggestion list for new ad groups.
+    # Runs even when there was no ENABLE/PAUSE to do.
+    new_count = 0
+    try:
+        new_count = report_new_adgroups()
+        print(f"Sheet tab '{SHEET_TAB_NEW}' rewritten with {new_count} row(s).")
+    except Exception as error:
+        print(f"[ERROR] '{SHEET_TAB_NEW}' update failed | {error}")
+
+    msg = (
+        f"Finished. {len(decisions)} checked, {done} changed, "
+        f"{failed} failed, {new_count} new ad group suggestion(s) "
+        f"(DRY_RUN={DRY_RUN})."
+    )
+    print(msg)
+    return msg, 200
