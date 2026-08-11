@@ -1,0 +1,51 @@
+import io
+import os
+
+import functions_framework
+import requests
+from google.cloud import bigquery
+
+PROJECT_ID = "project-id"
+DATASET = "dataset"
+TABLE_NAME = "table-name"
+TABLE = f"{PROJECT_ID}.{DATASET}.{TABLE_NAME}"
+FEED_URL = os.environ["CHANNABLE_FEED_URL"]
+
+
+# Entry point: load_feed
+@functions_framework.http
+def load_feed(request):
+    # Download the Channable NDJSON export
+    response = requests.get(FEED_URL, timeout=300)
+
+    # Raise an error unless Channable responds with 200 -- otherwise its
+    # HTML error page would end up in the table
+    response.raise_for_status()
+    print(f"Downloaded {len(response.content)} bytes.")
+
+    client = bigquery.Client(project=PROJECT_ID)
+
+    # NDJSON + autodetect for automatic schema detection + WRITE_TRUNCATE replaces
+    job_config = bigquery.LoadJobConfig(
+        source_format=bigquery.SourceFormat.NEWLINE_DELIMITED_JSON,
+        autodetect=True,
+        # Replace data and schema -- the feed is a full daily snapshot,
+        # so new fields are picked up automatically
+        write_disposition=bigquery.WriteDisposition.WRITE_TRUNCATE,
+    )
+
+    # Skip Cloud Storage entirely
+    # The data sits in memory as bytes -- BytesIO wraps it to look like a file
+    load_job = client.load_table_from_file(
+        io.BytesIO(response.content),
+        TABLE,
+        job_config=job_config,
+    )
+
+    # Wait until BigQuery is done, raises on failure
+    load_job.result()
+
+    table = client.get_table(TABLE)
+    msg = f"Loaded {table.num_rows} rows into {TABLE}."
+    print(msg)
+    return msg, 200
