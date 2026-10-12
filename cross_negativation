@@ -29,7 +29,7 @@ var MIN_SOURCE_KEYWORDS = 1;
 // --- Error notification ---
 var ERROR_EMAIL = 'cindy.reul@dertour.com';     // recipient of the alert mail
 var ERROR_SUBJECT = 'Fehlermeldung: Script fehlgeschlagen';
-var SCRIPT_NAME = 'Script Suchbegriffe';        // name used in the body of the alert mail
+var SCRIPT_NAME = 'Script Cross-Negativierung für PMAX Kampagnen';        // name used in the body of the alert mail
 var ACCOUNT_LABEL = 'Dertour Hotels';
 
 // =======================================================
