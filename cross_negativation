@@ -1,0 +1,231 @@
+/**
+ * last update: 12.10.26, CR
+ * version: 1.0
+ *
+ * Collects active keywords in ad groups of the source campaigns of a
+ * job within this account and syncs them into the negative keyword list of
+ * the same account, keeping the match type of each source keyword.
+ * On errors an alert mail is sent.
+ *
+ */
+// ==================== CONFIGURATION ====================
+
+// Source campaigns in THIS account
+var CAMPAIGN_IDS = [12345, 45678, 304858, 222333];
+
+// Negative keyword list in THIS account (shared set ID)
+var LIST_ID = 1111111;
+
+// Status filters for the source keywords.
+// 'PAUSED' | 'ENABLED' | '' (= any status except REMOVED)
+var CAMPAIGN_STATUS = '';
+var ADGROUP_STATUS = 'ENABLED';
+var KEYWORD_STATUS = 'ENABLED';
+
+// Safety net: abort if fewer than X source keywords are found
+// (prevents the list from being wiped on a misconfiguration).
+var MIN_SOURCE_KEYWORDS = 1;
+
+// --- Error notification ---
+var ERROR_EMAIL = 'cindy.reul@dertour.com';     // recipient of the alert mail
+var ERROR_SUBJECT = 'Fehlermeldung: Script fehlgeschlagen';
+var SCRIPT_NAME = 'Script Suchbegriffe';        // name used in the body of the alert mail
+var ACCOUNT_LABEL = 'Dertour Hotels';
+
+// =======================================================
+
+function main() {
+  try {
+    run_();
+  } catch (error) {
+    sendErrorMail_(error);
+    throw error;
+  }
+}
+
+/** Syncs the source keywords into the negative keyword list. */
+function run_() {
+  var account = AdsApp.currentAccount();
+
+  // --- Phase 1: collect keywords from the source campaigns ---
+  var targetKeywords = collectSourceKeywords_(CAMPAIGN_IDS);
+
+  if (countKeys_(targetKeywords) < MIN_SOURCE_KEYWORDS) {
+    throw new Error('Aborted: only ' + countKeys_(targetKeywords) +
+                    ' source keywords found (minimum: ' + MIN_SOURCE_KEYWORDS +
+                    '). List left unchanged.');
+  }
+
+  // --- Phase 2: sync the negative keyword list ---
+  var list = getNegativeKeywordList_(LIST_ID);
+  if (!list) {
+    throw new Error('Negative keyword list with ID ' + LIST_ID + ' not found in account ' +
+                    account.getCustomerId() + '. Check that the list lives in this account ' +
+                    'and the ID is correct.');
+  }
+
+  var currentEntries = getListEntries_(list);
+
+  // Missing in the list
+  var toAdd = [];
+  for (var key in targetKeywords) {
+    if (!currentEntries.hasOwnProperty(key)) {
+      toAdd.push(targetKeywords[key]);
+    }
+  }
+
+  // Obsolete in the list (wrong match type or no longer in the source campaigns)
+  var toRemove = [];
+  for (var key2 in currentEntries) {
+    if (!targetKeywords.hasOwnProperty(key2)) {
+      toRemove.push(currentEntries[key2]);
+    }
+  }
+
+  var CHUNK = 1000;
+  for (var i = 0; i < toAdd.length; i += CHUNK) {
+    list.addNegativeKeywords(toAdd.slice(i, i + CHUNK));
+  }
+
+  for (var r = 0; r < toRemove.length; r++) {
+    toRemove[r].remove();
+  }
+}
+
+/** Sends the alert mail. Never throws, so the original error stays visible. */
+function sendErrorMail_(error) {
+  try {
+    MailApp.sendEmail(ERROR_EMAIL, ERROR_SUBJECT, buildErrorBody_(error));
+  } catch (mailError) {
+    // ignore - the original error is still thrown by main()
+  }
+}
+
+/** Body of the alert mail. */
+function buildErrorBody_(error) {
+  var message = (error && error.message) ? error.message : String(error);
+
+  var body = 'Script ' + SCRIPT_NAME + ' - Negative Keywordliste im Account "' +
+             ACCOUNT_LABEL + '" fehlgeschlagen.\n\n' +
+             'Fehlermeldung:\n' + message + '\n';
+
+  if (error && error.stack) {
+    body += '\nDetails:\n' + error.stack + '\n';
+  }
+
+  return body;
+}
+
+/**
+ * Reads the keywords of the given campaigns with a single GAQL query.
+ * The match type of each source keyword is kept.
+ * Returns: { comparisonKey: notation }, e.g.
+ *   { 'EXACT|tui': '[tui]', 'PHRASE|tui hotel': '"tui hotel"', 'BROAD|tui reisen': 'tui reisen' }
+ */
+function collectSourceKeywords_(campaignIds) {
+  var result = {};
+
+  var rows = AdsApp.search(buildKeywordQuery_(campaignIds));
+  while (rows.hasNext()) {
+    var keyword = rows.next().adGroupCriterion.keyword;
+    var normalized = normalize_(stripMatchType_(keyword.text));
+    var matchType = String(keyword.matchType);
+
+    if (!normalized || !isSupportedMatchType_(matchType)) {
+      continue;
+    }
+
+    result[buildKey_(matchType, normalized)] = formatKeyword_(normalized, matchType);
+  }
+
+  return result;
+}
+
+/** Only EXACT, PHRASE and BROAD can be written to a negative keyword list. */
+function isSupportedMatchType_(matchType) {
+  return matchType === 'EXACT' || matchType === 'PHRASE' || matchType === 'BROAD';
+}
+
+/** Builds the GAQL query for the source campaigns. */
+function buildKeywordQuery_(campaignIds) {
+  var conditions = [
+    'ad_group_criterion.negative = FALSE',
+    buildStatusCondition_('campaign.status', CAMPAIGN_STATUS),
+    buildStatusCondition_('ad_group.status', ADGROUP_STATUS),
+    buildStatusCondition_('ad_group_criterion.status', KEYWORD_STATUS),
+    'campaign.id IN (' + campaignIds.join(', ') + ')'
+  ];
+
+  return 'SELECT ad_group_criterion.keyword.text, ' +
+         'ad_group_criterion.keyword.match_type ' +
+         'FROM keyword_view ' +
+         'WHERE ' + conditions.join(' AND ');
+}
+
+/** Status condition: given status, or any status except REMOVED if empty. */
+function buildStatusCondition_(field, status) {
+  if (status) {
+    return field + ' = "' + status + '"';
+  }
+  return field + ' != "REMOVED"';
+}
+
+/**
+ * Current entries of the negative keyword list.
+ * The match type comes from getMatchType(), NOT from the notation in
+ * getText() - getText() no longer returns [] or "" (see change 3.1).
+ * Returns: { comparisonKey: SharedNegativeKeyword }
+ */
+function getListEntries_(list) {
+  var result = {};
+  var it = list.negativeKeywords().get();
+  while (it.hasNext()) {
+    var negative = it.next();
+    var normalized = normalize_(stripMatchType_(negative.getText()));
+    if (normalized) {
+      result[buildKey_(negative.getMatchType(), normalized)] = negative;
+    }
+  }
+  return result;
+}
+
+/** Fetches the negative keyword list by its ID. */
+function getNegativeKeywordList_(listId) {
+  var it = AdsApp.negativeKeywordLists()
+      .withIds([listId])
+      .get();
+  return it.hasNext() ? it.next() : null;
+}
+
+/** Comparison key including the match type, so broad != phrase != exact. */
+function buildKey_(matchType, normalizedText) {
+  return matchType + '|' + normalizedText;
+}
+
+/** Renders a keyword in its match type notation for adding it to the list. */
+function formatKeyword_(text, matchType) {
+  var clean = normalize_(stripMatchType_(text));
+  if (matchType === 'EXACT') {
+    return '[' + clean + ']';
+  }
+  if (matchType === 'PHRASE') {
+    return '"' + clean + '"';
+  }
+  return clean;
+}
+
+/** Strips [] and "" from the keyword notation. */
+function stripMatchType_(text) {
+  return String(text).replace(/^\s*[\["]?\s*/, '').replace(/\s*[\]"]?\s*$/, '').trim();
+}
+
+/** Comparison key: lowercase, collapsed whitespace. */
+function normalize_(text) {
+  return String(text).toLowerCase().replace(/\s+/g, ' ').trim();
+}
+
+function countKeys_(obj) {
+  var n = 0;
+  for (var k in obj) { n++; }
+  return n;
+}
