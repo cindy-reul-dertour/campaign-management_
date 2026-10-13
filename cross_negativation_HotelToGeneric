@@ -5,14 +5,14 @@
  * Version: 1.0, last update 13/10/26 by CR
  *
  * What this script does:
- * exclude all existing keywords from "Hotel Adgroups" in "Generi Adgroup" of Destination Search campaigbs
+ * exclude all existing keywords from "Hotel Adgroups" in "Generic Adgroup" of Destination Search campaigbs
  * 
  */
 
 // --- Configuration ---
 
 // Campaigns the script works on
-var CAMPAIGN_IDS = ['12345', '45678', '23456'];
+var CAMPAIGN_IDS = ['11461989488'];
 
 // Ad groups whose keywords are used as source
 var SOURCE_ADGROUP_CONTAINS = '_Hotelnamen_';
@@ -47,6 +47,7 @@ function main() {
   }
 }
 
+
 function run() {
   // Build the campaign ID list for the GAQL "IN (...)" filter
   var campaignFilter = CAMPAIGN_IDS.join(', ');
@@ -54,8 +55,7 @@ function run() {
   // ------------------------------------------------------------------
   // STEP 1: Find target ad groups (_Generic_, enabled/paused, not zz-old)
   // ------------------------------------------------------------------
-  var targetsByCampaign = {};   // campaignId -> [adGroupId, ...]
-  var targetIdSet = {};         // adGroupId -> true (quick lookup)
+  var targetIds = [];           // list of target ad group IDs (numbers)
 
   // Query all enabled + paused ad groups of the configured campaigns
   // (removed ad groups are excluded by the status filter)
@@ -76,31 +76,27 @@ function run() {
     // Keep only ad groups whose name contains "_Generic_"
     if (agName.indexOf(TARGET_ADGROUP_CONTAINS) === -1) continue;
 
-    // Store the target ad group per campaign
-    var cId = String(ag.campaign.id);
-    var agId = String(ag.adGroup.id);
-    if (!targetsByCampaign[cId]) targetsByCampaign[cId] = [];
-    targetsByCampaign[cId].push(agId);
-    targetIdSet[agId] = true;
+    targetIds.push(Number(ag.adGroup.id));
   }
 
+  Logger.log('Target ad groups found: ' + targetIds.length);
+
   // ------------------------------------------------------------------
-  // STEP 2: Read source keywords and existing negatives in one query
+  // STEP 2: Read source keywords (positive keywords only)
   // ------------------------------------------------------------------
   var sourcesByCampaign = {};   // campaignId -> { key: {text, negType, sourceAdGroupId} }
-  var existingNegatives = {};   // adGroupId -> { key: true }
   var sourceCount = 0;          // number of unique source keywords (per campaign)
 
-  // Query all enabled + paused keyword criteria (positive and negative)
+  // Query all enabled + paused positive keywords
   // in enabled + paused ad groups of the configured campaigns
   var kwQuery =
     'SELECT campaign.id, ad_group.id, ad_group.name, ' +
-    'ad_group_criterion.negative, ad_group_criterion.keyword.text, ' +
-    'ad_group_criterion.keyword.match_type ' +
+    'ad_group_criterion.keyword.text, ad_group_criterion.keyword.match_type ' +
     'FROM ad_group_criterion ' +
     'WHERE campaign.id IN (' + campaignFilter + ') ' +
     "AND ad_group.status IN ('ENABLED', 'PAUSED') " +
     "AND ad_group_criterion.type = 'KEYWORD' " +
+    'AND ad_group_criterion.negative = FALSE ' +
     "AND ad_group_criterion.status IN ('ENABLED', 'PAUSED')";
 
   var kwRows = AdsApp.search(kwQuery);
@@ -108,32 +104,21 @@ function run() {
     var row = kwRows.next();
     var name = row.adGroup.name;
 
-    // Skip zz-old ad groups (no source keywords, no target)
+    // Skip zz-old ad groups
     if (isExcluded(name)) continue;
+
+    // Only use keywords from ad groups containing "_Hotelnamen_"
+    if (name.indexOf(SOURCE_ADGROUP_CONTAINS) === -1) continue;
 
     var campaignId = String(row.campaign.id);
     var adGroupId = String(row.adGroup.id);
-    var crit = row.adGroupCriterion;
 
     // Normalize keyword text (lowercase, no "+", single spaces)
-    var text = normalizeText(crit.keyword.text);
+    var text = normalizeText(row.adGroupCriterion.keyword.text);
     if (!text) continue;
-    var matchType = String(crit.keyword.matchType);
-
-    if (crit.negative) {
-      // Existing negative: remember it if it sits in a target ad group,
-      // so it will not be created a second time
-      if (targetIdSet[adGroupId]) {
-        if (!existingNegatives[adGroupId]) existingNegatives[adGroupId] = {};
-        existingNegatives[adGroupId][matchType + '|' + text] = true;
-      }
-      continue;
-    }
-
-    // Positive keyword: only use it if the ad group contains "_Hotelnamen_"
-    if (name.indexOf(SOURCE_ADGROUP_CONTAINS) === -1) continue;
 
     // Map match type: Exact -> Exact, Broad/Phrase -> Phrase
+    var matchType = String(row.adGroupCriterion.keyword.matchType);
     var negType = (matchType === 'EXACT') ? 'EXACT' : 'PHRASE';
 
     // Unique key per keyword + negative match type
@@ -159,83 +144,103 @@ function run() {
       MIN_SOURCE_KEYWORDS + '). Please check campaign IDs and ad group names.');
   }
 
-  // ------------------------------------------------------------------
-  // STEP 3: Work out which negatives still need to be added
-  // ------------------------------------------------------------------
-  var toAdd = {};        // adGroupId -> ['"keyword"', '[keyword]', ...]
-  var plannedCount = 0;
-
-  // Loop over every campaign that has target ad groups
-  for (var cid in targetsByCampaign) {
-    // Source keywords of the same campaign only
-    var sources = sourcesByCampaign[cid];
-    if (!sources) continue;
-    var targets = targetsByCampaign[cid];
-
-    // Loop over every target ad group in this campaign
-    for (var i = 0; i < targets.length; i++) {
-      var targetId = targets[i];
-      var existing = existingNegatives[targetId] || {};
-
-      // Check every source keyword against this target ad group
-      for (var k in sources) {
-        var src = sources[k];
-
-        // Never exclude a keyword in its own ad group
-        if (src.sourceAdGroupId === targetId) continue;
-
-        // Skip if this negative already exists
-        if (existing[k]) continue;
-
-        // Build the negative keyword string: [exact] or "phrase"
-        var negString = (src.negType === 'EXACT')
-          ? '[' + src.text + ']'
-          : '"' + src.text + '"';
-
-        // Add to the to-do list for this ad group
-        if (!toAdd[targetId]) toAdd[targetId] = [];
-        toAdd[targetId].push(negString);
-        plannedCount++;
-      }
-    }
-  }
-
-  Logger.log('New negatives to add: ' + plannedCount);
-
-  // Nothing new -> end the run
-  if (plannedCount === 0) {
-    Logger.log('Nothing to do – all keywords are already excluded.');
+  // Nothing to target -> end the run
+  if (targetIds.length === 0) {
+    Logger.log('No target ad groups found – nothing to do.');
     return;
   }
 
   // ------------------------------------------------------------------
-  // STEP 4: Create the negative keywords
+  // STEP 3: Read existing negatives on campaign level + negative keyword lists
+  // ------------------------------------------------------------------
+  var campaignNegatives = {};   // campaignId -> { text: {EXACT, PHRASE, BROAD} }
+
+  var campaigns = AdsApp.campaigns()
+    .withIds(CAMPAIGN_IDS.map(function (id) { return Number(id); }))
+    .get();
+
+  while (campaigns.hasNext()) {
+    var campaign = campaigns.next();
+    var cMap = {};
+
+    // Campaign-level negative keywords
+    addNegativesToMap(campaign.negativeKeywords().get(), cMap);
+
+    // Negative keyword lists attached to the campaign
+    var lists = campaign.negativeKeywordLists().get();
+    while (lists.hasNext()) {
+      addNegativesToMap(lists.next().negativeKeywords().get(), cMap);
+    }
+
+    campaignNegatives[String(campaign.getId())] = cMap;
+  }
+
+  // ------------------------------------------------------------------
+  // STEP 4: Per target ad group: read its negatives, then add missing ones
   // ------------------------------------------------------------------
   var errors = [];
   var addedCount = 0;
+  var skippedCount = 0;
 
-  // Load all target ad groups that need new negatives
-  var adGroupIds = Object.keys(toAdd).map(function (id) { return Number(id); });
-  var adGroups = AdsApp.adGroups().withIds(adGroupIds).get();
+  var adGroups = AdsApp.adGroups().withIds(targetIds).get();
 
   while (adGroups.hasNext()) {
     var adGroup = adGroups.next();
-    var list = toAdd[String(adGroup.getId())] || [];
+    var targetId = String(adGroup.getId());
+    var cid = String(adGroup.getCampaign().getId());
 
-    // Create each negative; collect errors instead of stopping the run
-    for (var j = 0; j < list.length; j++) {
+    // Source keywords of the same campaign only
+    var sources = sourcesByCampaign[cid];
+    if (!sources) continue;
+
+    // Existing negatives directly in this ad group
+    var agMap = {};
+    addNegativesToMap(adGroup.negativeKeywords().get(), agMap);
+
+    // Existing negatives on campaign level / lists of this campaign
+    var cMapForAg = campaignNegatives[cid] || {};
+
+    var added = 0;
+
+    // Check every source keyword against this target ad group
+    for (var k in sources) {
+      var src = sources[k];
+
+      // Never exclude a keyword in its own ad group
+      if (src.sourceAdGroupId === targetId) continue;
+
+      // Skip if exactly this negative (same text + match type) already exists (ad group, campaign or list)
+      if (isCovered(agMap, src.text, src.negType) || isCovered(cMapForAg, src.text, src.negType)) {
+        skippedCount++;
+        Logger.log('Already excluded, skipped: ' + adGroup.getName() + ' / ' + src.text + ' (' + src.negType + ')');
+        continue;
+      }
+
+      // Build the negative keyword string: [exact] or "phrase"
+      var negString = (src.negType === 'EXACT')
+        ? '[' + src.text + ']'
+        : '"' + src.text + '"';
+
+      // Create the negative; collect errors instead of stopping the run
       try {
-        adGroup.createNegativeKeyword(list[j]);
+        adGroup.createNegativeKeyword(negString);
         addedCount++;
+        added++;
+        Logger.log('Added: ' + adGroup.getName() + ' / ' + negString);
+
+        // Remember it, so it is not added twice within the same run
+        markInMap(agMap, src.text, src.negType);
       } catch (err) {
         errors.push('Campaign "' + adGroup.getCampaign().getName() + '" / Ad group "' +
-          adGroup.getName() + '" / Keyword ' + list[j] + ': ' + err);
+          adGroup.getName() + '" / Keyword ' + negString + ': ' + err);
       }
     }
-    Logger.log(adGroup.getName() + ': ' + list.length + ' negatives processed');
+
+    Logger.log(adGroup.getName() + ': ' + added + ' negatives added');
   }
 
-  Logger.log('Done. Added: ' + addedCount + ' | Errors: ' + errors.length);
+  Logger.log('Done. Added: ' + addedCount + ' | Already existing (skipped): ' +
+    skippedCount + ' | Errors: ' + errors.length);
 
   // Send alert mail if any single negative could not be created
   if (errors.length > 0) {
@@ -245,6 +250,31 @@ function run() {
 
 
 // --- Helper functions ---
+
+// Reads negative keywords from an iterator into a map: text -> {EXACT, PHRASE, BROAD}
+function addNegativesToMap(iterator, map) {
+  while (iterator.hasNext()) {
+    var neg = iterator.next();
+    // getText() returns e.g. [hotel], "hotel" or hotel -> strip brackets/quotes
+    var text = normalizeText(String(neg.getText()).replace(/[\[\]"]/g, ''));
+    if (!text) continue;
+    markInMap(map, text, String(neg.getMatchType()));
+  }
+}
+
+// Marks a text + match type as existing in the map
+function markInMap(map, text, matchType) {
+  if (!map[text]) map[text] = {};
+  map[text][matchType] = true;
+}
+
+// Checks whether exactly the same negative already exists
+// (same text AND same match type: [exact] only matches [exact], "phrase" only matches "phrase")
+function isCovered(map, text, negType) {
+  var m = map[text];
+  if (!m) return false;
+  return !!m[negType];
+}
 
 // Returns true if the ad group name contains one of the exclude strings (case-insensitive)
 function isExcluded(adGroupName) {
