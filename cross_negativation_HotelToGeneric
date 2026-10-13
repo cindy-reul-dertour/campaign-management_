@@ -1,36 +1,31 @@
 /**
- * last update: 12.10.26, CR
- * version: 1.0
- * Script Cross-Negativierung für Search Kampagnen
- * Google Ads Script – single account
+ * Script Cross-Negativierung für Search Kampagnen - Hotel to Generic
+ * Account: Dertour Hotels (single account level)
  *
- * Every keyword from the ad groups whose name contains SOURCE_ADGROUP_CONTAINS
- * is added as a negative keyword (same match type) to all ad groups whose name
- * contains TARGET_ADGROUP_CONTAINS – always only within the keyword's own campaign.
+ * Version: 1.0, last update 13/10/26 by CR
  *
- * - Negatives that already exist are skipped, so the script can run on a schedule.
- * - The script only adds negatives; it never removes any.
- * - Any error (incl. single negatives that could not be created) sends an alert mail.
+ * What this script does:
+ * exclude all existing keywords from "Hotel Adgroups" in "Generi Adgroup" of Destination Search campaigbs
+ * 
  */
 
-// =============================== CONFIG ===============================
+// --- Configuration ---
 
-// Campaigns to process
-var CAMPAIGN_IDS = [12345, 45678, 23456];
+// Campaigns the script works on
+var CAMPAIGN_IDS = ['12345', '45678', '23456'];
 
-// Ad group name filters ("contains", not case-sensitive)
-var SOURCE_ADGROUP_CONTAINS = '_Hotelnamen_';   // keywords are taken from here
-var TARGET_ADGROUP_CONTAINS = '_Generic_';      // negatives are added here
+// Ad groups whose keywords are used as source
+var SOURCE_ADGROUP_CONTAINS = '_Hotelnamen_';
 
-// Status filters for the source keywords.
-// 'PAUSED' | 'ENABLED' | '' (= any status except REMOVED)
-var CAMPAIGN_STATUS = '';
-var ADGROUP_STATUS = 'ENABLED';
-var KEYWORD_STATUS = 'ENABLED';
-// Target ad groups: all enabled and paused _Generic_ ad groups of the same campaign.
+// Ad groups that receive the negative keywords
+var TARGET_ADGROUP_CONTAINS = '_Generic_';
+
+// Ad groups containing these strings are skipped entirely
+// (checked case-insensitive -> covers "zz-OLD" and "zz-old")
+var EXCLUDE_ADGROUP_CONTAINS = ['zz-old'];
 
 // Safety net: abort if fewer than X source keywords are found
-// (catches a misconfiguration, e.g. wrong campaign IDs or ad group names).
+// (prevents the list from being wiped on a misconfiguration).
 var MIN_SOURCE_KEYWORDS = 1;
 
 // --- Error notification ---
@@ -39,601 +34,250 @@ var ERROR_SUBJECT = 'Fehlermeldung: Script fehlgeschlagen';
 var SCRIPT_NAME = 'Script Cross-Negativierung für Search Kampagnen';        // name used in the body of the alert mail
 var ACCOUNT_LABEL = 'Dertour Hotels';
 
-// ============================ END OF CONFIG ===========================
 
-var MUTATE_BATCH_SIZE = 5000;   // operations per mutate call (API limit: 10,000)
-var MAX_ERRORS_IN_MAIL = 50;
-
-
+// Entry point: runs the script and sends an alert email if anything crashes
 function main() {
   try {
     run();
   } catch (e) {
-    sendErrorMail(e);
-    throw e; // marks the run as failed in the script history
+    // Log the error, send the alert mail, then re-throw so the run is marked as failed
+    Logger.log('ERROR: ' + e);
+    sendErrorMail([String(e && e.stack ? e.stack : e)]);
+    throw e;
   }
 }
-
 
 function run() {
-  validateConfig();
+  // Build the campaign ID list for the GAQL "IN (...)" filter
+  var campaignFilter = CAMPAIGN_IDS.join(', ');
 
-  // 1) Source keywords, grouped by campaign
-  const source = getSourceKeywords();
-  Logger.log('Quell-Keywords gefunden: ' + source.count);
-  if (source.count < MIN_SOURCE_KEYWORDS) {
-    throw new Error(
-      'Sicherheitsabbruch: nur ' + source.count + ' Quell-Keywords gefunden (Minimum: ' +
-      MIN_SOURCE_KEYWORDS + '). Es wurde nichts geändert. ' +
-      'Bitte Kampagnen-IDs, Adgroup-Namen und Statusfilter prüfen.');
-  }
+  // ------------------------------------------------------------------
+  // STEP 1: Find target ad groups (_Generic_, enabled/paused, not zz-old)
+  // ------------------------------------------------------------------
+  var targetsByCampaign = {};   // campaignId -> [adGroupId, ...]
+  var targetIdSet = {};         // adGroupId -> true (quick lookup)
 
-  // 2) Target ad groups in the same campaigns + the negatives they already have
-  const targets = getTargetAdGroups(source.byCampaign);
-  const existing = getExistingNegatives(targets);
-
-  // 3) Plan the missing negatives
-  const stats = {};
-  Object.keys(source.byCampaign).forEach(function (campaignId) {
-    stats[campaignId] = {
-      keywords: Object.keys(source.byCampaign[campaignId]).length,
-      adGroups: 0, created: 0, existing: 0, failed: 0
-    };
-  });
-
-  const planned = [];
-  targets.forEach(function (adGroup) {
-    const keywords = source.byCampaign[adGroup.campaignId];
-    const s = stats[adGroup.campaignId];
-    s.adGroups++;
-    Object.keys(keywords).forEach(function (key) {
-      if (existing[adGroup.id][key]) {
-        s.existing++;
-      } else {
-        planned.push({ adGroup: adGroup, keyword: keywords[key] });
-      }
-    });
-  });
-
-  // 4) Create them
-  const failures = [];
-  createNegatives(planned).forEach(function (error, i) {
-    const p = planned[i];
-    const s = stats[p.adGroup.campaignId];
-    if (error) {
-      s.failed++;
-      failures.push('Kampagne ' + p.adGroup.campaignId + ' | ' + p.adGroup.name + ' | ' +
-        formatKeyword(p.keyword) + ': ' + error);
-    } else {
-      s.created++;
-    }
-  });
-
-  // 5) Summary per campaign
-  CAMPAIGN_IDS.forEach(function (id) {
-    const s = stats[String(id)];
-    if (!s) {
-      Logger.log('Kampagne ' + id + ': keine Quell-Keywords gefunden');
-    } else if (s.adGroups === 0) {
-      Logger.log('Kampagne ' + id + ': ' + s.keywords + ' Quell-Keywords, aber keine Adgroup mit "' +
-        TARGET_ADGROUP_CONTAINS + '" gefunden');
-    } else {
-      Logger.log('Kampagne ' + id + ': ' + s.keywords + ' Quell-Keywords | ' + s.adGroups +
-        ' Ziel-Adgroups | ' + s.created + ' neu angelegt | ' + s.existing + ' schon vorhanden' +
-        (s.failed ? ' | ' + s.failed + ' fehlgeschlagen' : ''));
-    }
-  });
-
-  if (failures.length > 0) {
-    failures.forEach(function (line) { Logger.log('FEHLER: ' + line); });
-    throw new Error(
-      failures.length + ' von ' + planned.length + ' Negatives konnten nicht angelegt werden ' +
-      '(alle anderen wurden angelegt):\n' +
-      failures.slice(0, MAX_ERRORS_IN_MAIL).join('\n') +
-      (failures.length > MAX_ERRORS_IN_MAIL
-        ? '\n... und ' + (failures.length - MAX_ERRORS_IN_MAIL) + ' weitere, siehe Script-Log'
-        : ''));
-  }
-}
-
-
-// Returns { byCampaign: { campaignId: { key: {text, matchType} } }, count }
-function getSourceKeywords() {
-  const byCampaign = {};
-  let count = 0;
-
-  const rows = AdsApp.search(
-    'SELECT campaign.id, ad_group.name, ' +
-    'ad_group_criterion.keyword.text, ad_group_criterion.keyword.match_type ' +
-    'FROM keyword_view ' +
-    'WHERE campaign.id IN (' + CAMPAIGN_IDS.join(', ') + ') ' +
-    'AND ad_group_criterion.negative = FALSE ' +
-    'AND ' + statusCondition('campaign.status', CAMPAIGN_STATUS) + ' ' +
-    'AND ' + statusCondition('ad_group.status', ADGROUP_STATUS) + ' ' +
-    'AND ' + statusCondition('ad_group_criterion.status', KEYWORD_STATUS));
-
-  while (rows.hasNext()) {
-    const row = rows.next();
-    if (!nameContains(row.adGroup.name, SOURCE_ADGROUP_CONTAINS)) continue;
-
-    const matchType = row.adGroupCriterion.keyword.matchType;
-    const text = cleanText(row.adGroupCriterion.keyword.text, matchType);
-    const campaignId = String(row.campaign.id);
-    const key = keyOf(text, matchType);
-
-    byCampaign[campaignId] = byCampaign[campaignId] || {};
-    if (!byCampaign[campaignId][key]) {
-      byCampaign[campaignId][key] = { text: text, matchType: matchType };
-    }
-    count++;
-  }
-  return { byCampaign: byCampaign, count: count };
-}
-
-
-// Enabled and paused target ad groups in campaigns that have source keywords
-function getTargetAdGroups(sourceByCampaign) {
-  const targets = [];
-
-  const rows = AdsApp.search(
-    'SELECT campaign.id, ad_group.id, ad_group.name, ad_group.resource_name ' +
+  // Query all enabled + paused ad groups of the configured campaigns
+  // (removed ad groups are excluded by the status filter)
+  var agQuery =
+    'SELECT campaign.id, ad_group.id, ad_group.name ' +
     'FROM ad_group ' +
-    'WHERE campaign.id IN (' + CAMPAIGN_IDS.join(', ') + ') ' +
-    "AND ad_group.status != 'REMOVED'");
+    'WHERE campaign.id IN (' + campaignFilter + ') ' +
+    "AND ad_group.status IN ('ENABLED', 'PAUSED')";
 
-  while (rows.hasNext()) {
-    const row = rows.next();
-    const campaignId = String(row.campaign.id);
-    const name = row.adGroup.name;
-    if (!sourceByCampaign[campaignId] || !nameContains(name, TARGET_ADGROUP_CONTAINS)) continue;
+  var agRows = AdsApp.search(agQuery);
+  while (agRows.hasNext()) {
+    var ag = agRows.next();
+    var agName = ag.adGroup.name;
 
-    // Safety: never add negatives to an ad group that is itself a source ad group
-    if (nameContains(name, SOURCE_ADGROUP_CONTAINS)) {
-      Logger.log('Übersprungen (Name enthält "' + SOURCE_ADGROUP_CONTAINS + '" und "' +
-        TARGET_ADGROUP_CONTAINS + '"): ' + name);
+    // Skip zz-old ad groups
+    if (isExcluded(agName)) continue;
+
+    // Keep only ad groups whose name contains "_Generic_"
+    if (agName.indexOf(TARGET_ADGROUP_CONTAINS) === -1) continue;
+
+    // Store the target ad group per campaign
+    var cId = String(ag.campaign.id);
+    var agId = String(ag.adGroup.id);
+    if (!targetsByCampaign[cId]) targetsByCampaign[cId] = [];
+    targetsByCampaign[cId].push(agId);
+    targetIdSet[agId] = true;
+  }
+
+  // ------------------------------------------------------------------
+  // STEP 2: Read source keywords and existing negatives in one query
+  // ------------------------------------------------------------------
+  var sourcesByCampaign = {};   // campaignId -> { key: {text, negType, sourceAdGroupId} }
+  var existingNegatives = {};   // adGroupId -> { key: true }
+  var sourceCount = 0;          // number of unique source keywords (per campaign)
+
+  // Query all enabled + paused keyword criteria (positive and negative)
+  // in enabled + paused ad groups of the configured campaigns
+  var kwQuery =
+    'SELECT campaign.id, ad_group.id, ad_group.name, ' +
+    'ad_group_criterion.negative, ad_group_criterion.keyword.text, ' +
+    'ad_group_criterion.keyword.match_type ' +
+    'FROM ad_group_criterion ' +
+    'WHERE campaign.id IN (' + campaignFilter + ') ' +
+    "AND ad_group.status IN ('ENABLED', 'PAUSED') " +
+    "AND ad_group_criterion.type = 'KEYWORD' " +
+    "AND ad_group_criterion.status IN ('ENABLED', 'PAUSED')";
+
+  var kwRows = AdsApp.search(kwQuery);
+  while (kwRows.hasNext()) {
+    var row = kwRows.next();
+    var name = row.adGroup.name;
+
+    // Skip zz-old ad groups (no source keywords, no target)
+    if (isExcluded(name)) continue;
+
+    var campaignId = String(row.campaign.id);
+    var adGroupId = String(row.adGroup.id);
+    var crit = row.adGroupCriterion;
+
+    // Normalize keyword text (lowercase, no "+", single spaces)
+    var text = normalizeText(crit.keyword.text);
+    if (!text) continue;
+    var matchType = String(crit.keyword.matchType);
+
+    if (crit.negative) {
+      // Existing negative: remember it if it sits in a target ad group,
+      // so it will not be created a second time
+      if (targetIdSet[adGroupId]) {
+        if (!existingNegatives[adGroupId]) existingNegatives[adGroupId] = {};
+        existingNegatives[adGroupId][matchType + '|' + text] = true;
+      }
       continue;
     }
-    targets.push({
-      id: String(row.adGroup.id),
-      name: name,
-      campaignId: campaignId,
-      resourceName: row.adGroup.resourceName
-    });
-  }
-  return targets;
-}
 
+    // Positive keyword: only use it if the ad group contains "_Hotelnamen_"
+    if (name.indexOf(SOURCE_ADGROUP_CONTAINS) === -1) continue;
 
-// Returns { adGroupId: { key: true } } for every target ad group
-function getExistingNegatives(targets) {
-  const existing = {};
-  if (targets.length === 0) return existing;
-  targets.forEach(function (adGroup) { existing[adGroup.id] = {}; });
+    // Map match type: Exact -> Exact, Broad/Phrase -> Phrase
+    var negType = (matchType === 'EXACT') ? 'EXACT' : 'PHRASE';
 
-  const rows = AdsApp.search(
-    'SELECT ad_group.id, ad_group_criterion.keyword.text, ad_group_criterion.keyword.match_type ' +
-    'FROM ad_group_criterion ' +
-    'WHERE ad_group.id IN (' + Object.keys(existing).join(', ') + ') ' +
-    "AND ad_group_criterion.type = 'KEYWORD' " +
-    'AND ad_group_criterion.negative = TRUE ' +
-    "AND ad_group_criterion.status != 'REMOVED'");
+    // Unique key per keyword + negative match type
+    var key = negType + '|' + text;
 
-  while (rows.hasNext()) {
-    const row = rows.next();
-    const keyword = row.adGroupCriterion.keyword;
-    existing[String(row.adGroup.id)][keyOf(keyword.text, keyword.matchType)] = true;
-  }
-  return existing;
-}
-
-
-// Creates the negatives in batches. Returns one entry per planned negative:
-// null if it was created, otherwise the error message.
-function createNegatives(planned) {
-  let errors = [];
-  for (let start = 0; start < planned.length; start += MUTATE_BATCH_SIZE) {
-    const batch = planned.slice(start, start + MUTATE_BATCH_SIZE);
-    const operations = batch.map(function (p) {
-      return {
-        adGroupCriterionOperation: {
-          create: {
-            adGroup: p.adGroup.resourceName,
-            negative: true,
-            keyword: { text: p.keyword.text, matchType: p.keyword.matchType }
-          }
-        }
+    // Store source keyword per campaign (duplicates are counted once)
+    if (!sourcesByCampaign[campaignId]) sourcesByCampaign[campaignId] = {};
+    if (!sourcesByCampaign[campaignId][key]) {
+      sourcesByCampaign[campaignId][key] = {
+        text: text,
+        negType: negType,
+        sourceAdGroupId: adGroupId
       };
-    });
-    const results = AdsApp.mutateAll(operations, { partialFailure: true });
-    errors = errors.concat(results.map(function (result) {
-      return result.isSuccessful() ? null : result.getErrorMessages().join('; ');
-    }));
-  }
-  return errors;
-}
-
-
-// --------------------------------------------------------------------
-// Helpers
-// --------------------------------------------------------------------
-
-function validateConfig() {
-  const statuses = {
-    CAMPAIGN_STATUS: CAMPAIGN_STATUS,
-    ADGROUP_STATUS: ADGROUP_STATUS,
-    KEYWORD_STATUS: KEYWORD_STATUS
-  };
-  Object.keys(statuses).forEach(function (name) {
-    if (['', 'ENABLED', 'PAUSED'].indexOf(statuses[name]) === -1) {
-      throw new Error('Ungültiger Wert für ' + name + ': "' + statuses[name] +
-        '" (erlaubt: \'ENABLED\', \'PAUSED\' oder \'\')');
+      sourceCount++;
     }
-  });
-  if (CAMPAIGN_IDS.length === 0 ||
-      CAMPAIGN_IDS.some(function (id) { return !/^\d+$/.test(String(id)); })) {
-    throw new Error('Ungültige CAMPAIGN_IDS: ' + CAMPAIGN_IDS.join(', '));
-  }
-  if (!SOURCE_ADGROUP_CONTAINS || !TARGET_ADGROUP_CONTAINS) {
-    throw new Error('SOURCE_ADGROUP_CONTAINS und TARGET_ADGROUP_CONTAINS dürfen nicht leer sein.');
-  }
-}
-
-// '' = any status except REMOVED
-function statusCondition(field, status) {
-  return status ? field + " = '" + status + "'" : field + " != 'REMOVED'";
-}
-
-function nameContains(name, part) {
-  return String(name).toLowerCase().indexOf(String(part).toLowerCase()) !== -1;
-}
-
-// Normalises spacing. For broad match the legacy "+" modifier is dropped
-// (a broad negative already requires all of its words).
-function cleanText(text, matchType) {
-  const clean = String(text).trim().replace(/\s+/g, ' ');
-  return matchType === 'BROAD' ? clean.replace(/(^| )\+/g, '$1') : clean;
-}
-
-// Duplicate check: same match type + same text (not case-sensitive)
-function keyOf(text, matchType) {
-  return matchType + '|' + cleanText(text, matchType).toLowerCase();
-}
-
-function formatKeyword(keyword) {
-  if (keyword.matchType === 'EXACT') return '[' + keyword.text + ']';
-  if (keyword.matchType === 'PHRASE') return '"' + keyword.text + '"';
-  return keyword.text;
-}
-
-function sendErrorMail(error) {
-  try {
-    const account = AdsApp.currentAccount();
-    const time = Utilities.formatDate(new Date(), account.getTimeZone(), 'dd.MM.yyyy HH:mm:ss');
-    const message = (error && error.message) ? error.message : String(error);
-    MailApp.sendEmail(ERROR_EMAIL, ERROR_SUBJECT,
-      'Das Script "' + SCRIPT_NAME + '" ist fehlgeschlagen.\n\n' +
-      'Konto: ' + ACCOUNT_LABEL + ' (' + account.getCustomerId() + ')\n' +
-      'Zeitpunkt: ' + time + '\n\n' +
-      'Fehler:\n' + message);
-  } catch (mailError) {
-    Logger.log('Fehlermail konnte nicht gesendet werden: ' + mailError);
-  }
-}
- * Script Cross-Negativierung für Search Kampagnen
- * Google Ads Script – single account
- *
- * Every keyword from the ad groups whose name contains SOURCE_ADGROUP_CONTAINS
- * is added as a negative keyword (same match type) to all ad groups whose name
- * contains TARGET_ADGROUP_CONTAINS – always only within the keyword's own campaign.
- *
- * - Negatives that already exist are skipped, so the script can run on a schedule.
- * - The script only adds negatives; it never removes any.
- * - Any error (incl. single negatives that could not be created) sends an alert mail.
- */
-
-// =============================== CONFIG ===============================
-
-// Campaigns to process
-var CAMPAIGN_IDS = [12345, 45678, 23456];
-
-// Ad group name filters ("contains", not case-sensitive)
-var SOURCE_ADGROUP_CONTAINS = '_Hotelnamen_';   // keywords are taken from here
-var TARGET_ADGROUP_CONTAINS = '_Generic_';      // negatives are added here
-
-// Status filters for the source keywords.
-// 'PAUSED' | 'ENABLED' | '' (= any status except REMOVED)
-var CAMPAIGN_STATUS = '';
-var ADGROUP_STATUS = 'ENABLED';
-var KEYWORD_STATUS = 'ENABLED';
-// Target ad groups: all enabled and paused _Generic_ ad groups of the same campaign.
-
-// Safety net: abort if fewer than X source keywords are found
-// (catches a misconfiguration, e.g. wrong campaign IDs or ad group names).
-var MIN_SOURCE_KEYWORDS = 1;
-
-// --- Error notification ---
-var ERROR_EMAIL = 'cindy.reul@dertour.com';     // recipient of the alert mail
-var ERROR_SUBJECT = 'Fehlermeldung: Script fehlgeschlagen';
-var SCRIPT_NAME = 'Script Cross-Negativierung für Search Kampagnen';        // name used in the body of the alert mail
-var ACCOUNT_LABEL = 'Dertour Hotels';
-
-// ============================ END OF CONFIG ===========================
-
-var MUTATE_BATCH_SIZE = 5000;   // operations per mutate call (API limit: 10,000)
-var MAX_ERRORS_IN_MAIL = 50;
-
-
-function main() {
-  try {
-    run();
-  } catch (e) {
-    sendErrorMail(e);
-    throw e; // marks the run as failed in the script history
-  }
-}
-
-
-function run() {
-  validateConfig();
-
-  // 1) Source keywords, grouped by campaign
-  const source = getSourceKeywords();
-  Logger.log('Quell-Keywords gefunden: ' + source.count);
-  if (source.count < MIN_SOURCE_KEYWORDS) {
-    throw new Error(
-      'Sicherheitsabbruch: nur ' + source.count + ' Quell-Keywords gefunden (Minimum: ' +
-      MIN_SOURCE_KEYWORDS + '). Es wurde nichts geändert. ' +
-      'Bitte Kampagnen-IDs, Adgroup-Namen und Statusfilter prüfen.');
   }
 
-  // 2) Target ad groups in the same campaigns + the negatives they already have
-  const targets = getTargetAdGroups(source.byCampaign);
-  const existing = getExistingNegatives(targets);
+  Logger.log('Source keywords found (unique per campaign): ' + sourceCount);
 
-  // 3) Plan the missing negatives
-  const stats = {};
-  Object.keys(source.byCampaign).forEach(function (campaignId) {
-    stats[campaignId] = {
-      keywords: Object.keys(source.byCampaign[campaignId]).length,
-      adGroups: 0, created: 0, existing: 0, failed: 0
-    };
-  });
+  // Safety net: abort if too few source keywords were found
+  if (sourceCount < MIN_SOURCE_KEYWORDS) {
+    throw new Error('Aborted: only ' + sourceCount + ' source keywords found (minimum: ' +
+      MIN_SOURCE_KEYWORDS + '). Please check campaign IDs and ad group names.');
+  }
 
-  const planned = [];
-  targets.forEach(function (adGroup) {
-    const keywords = source.byCampaign[adGroup.campaignId];
-    const s = stats[adGroup.campaignId];
-    s.adGroups++;
-    Object.keys(keywords).forEach(function (key) {
-      if (existing[adGroup.id][key]) {
-        s.existing++;
-      } else {
-        planned.push({ adGroup: adGroup, keyword: keywords[key] });
+  // ------------------------------------------------------------------
+  // STEP 3: Work out which negatives still need to be added
+  // ------------------------------------------------------------------
+  var toAdd = {};        // adGroupId -> ['"keyword"', '[keyword]', ...]
+  var plannedCount = 0;
+
+  // Loop over every campaign that has target ad groups
+  for (var cid in targetsByCampaign) {
+    // Source keywords of the same campaign only
+    var sources = sourcesByCampaign[cid];
+    if (!sources) continue;
+    var targets = targetsByCampaign[cid];
+
+    // Loop over every target ad group in this campaign
+    for (var i = 0; i < targets.length; i++) {
+      var targetId = targets[i];
+      var existing = existingNegatives[targetId] || {};
+
+      // Check every source keyword against this target ad group
+      for (var k in sources) {
+        var src = sources[k];
+
+        // Never exclude a keyword in its own ad group
+        if (src.sourceAdGroupId === targetId) continue;
+
+        // Skip if this negative already exists
+        if (existing[k]) continue;
+
+        // Build the negative keyword string: [exact] or "phrase"
+        var negString = (src.negType === 'EXACT')
+          ? '[' + src.text + ']'
+          : '"' + src.text + '"';
+
+        // Add to the to-do list for this ad group
+        if (!toAdd[targetId]) toAdd[targetId] = [];
+        toAdd[targetId].push(negString);
+        plannedCount++;
       }
-    });
-  });
-
-  // 4) Create them
-  const failures = [];
-  createNegatives(planned).forEach(function (error, i) {
-    const p = planned[i];
-    const s = stats[p.adGroup.campaignId];
-    if (error) {
-      s.failed++;
-      failures.push('Kampagne ' + p.adGroup.campaignId + ' | ' + p.adGroup.name + ' | ' +
-        formatKeyword(p.keyword) + ': ' + error);
-    } else {
-      s.created++;
     }
-  });
+  }
 
-  // 5) Summary per campaign
-  CAMPAIGN_IDS.forEach(function (id) {
-    const s = stats[String(id)];
-    if (!s) {
-      Logger.log('Kampagne ' + id + ': keine Quell-Keywords gefunden');
-    } else if (s.adGroups === 0) {
-      Logger.log('Kampagne ' + id + ': ' + s.keywords + ' Quell-Keywords, aber keine Adgroup mit "' +
-        TARGET_ADGROUP_CONTAINS + '" gefunden');
-    } else {
-      Logger.log('Kampagne ' + id + ': ' + s.keywords + ' Quell-Keywords | ' + s.adGroups +
-        ' Ziel-Adgroups | ' + s.created + ' neu angelegt | ' + s.existing + ' schon vorhanden' +
-        (s.failed ? ' | ' + s.failed + ' fehlgeschlagen' : ''));
+  Logger.log('New negatives to add: ' + plannedCount);
+
+  // Nothing new -> end the run
+  if (plannedCount === 0) {
+    Logger.log('Nothing to do – all keywords are already excluded.');
+    return;
+  }
+
+  // ------------------------------------------------------------------
+  // STEP 4: Create the negative keywords
+  // ------------------------------------------------------------------
+  var errors = [];
+  var addedCount = 0;
+
+  // Load all target ad groups that need new negatives
+  var adGroupIds = Object.keys(toAdd).map(function (id) { return Number(id); });
+  var adGroups = AdsApp.adGroups().withIds(adGroupIds).get();
+
+  while (adGroups.hasNext()) {
+    var adGroup = adGroups.next();
+    var list = toAdd[String(adGroup.getId())] || [];
+
+    // Create each negative; collect errors instead of stopping the run
+    for (var j = 0; j < list.length; j++) {
+      try {
+        adGroup.createNegativeKeyword(list[j]);
+        addedCount++;
+      } catch (err) {
+        errors.push('Campaign "' + adGroup.getCampaign().getName() + '" / Ad group "' +
+          adGroup.getName() + '" / Keyword ' + list[j] + ': ' + err);
+      }
     }
-  });
+    Logger.log(adGroup.getName() + ': ' + list.length + ' negatives processed');
+  }
 
-  if (failures.length > 0) {
-    failures.forEach(function (line) { Logger.log('FEHLER: ' + line); });
-    throw new Error(
-      failures.length + ' von ' + planned.length + ' Negatives konnten nicht angelegt werden ' +
-      '(alle anderen wurden angelegt):\n' +
-      failures.slice(0, MAX_ERRORS_IN_MAIL).join('\n') +
-      (failures.length > MAX_ERRORS_IN_MAIL
-        ? '\n... und ' + (failures.length - MAX_ERRORS_IN_MAIL) + ' weitere, siehe Script-Log'
-        : ''));
+  Logger.log('Done. Added: ' + addedCount + ' | Errors: ' + errors.length);
+
+  // Send alert mail if any single negative could not be created
+  if (errors.length > 0) {
+    sendErrorMail(errors);
   }
 }
 
 
-// Returns { byCampaign: { campaignId: { key: {text, matchType} } }, count }
-function getSourceKeywords() {
-  const byCampaign = {};
-  let count = 0;
+// --- Helper functions ---
 
-  const rows = AdsApp.search(
-    'SELECT campaign.id, ad_group.name, ' +
-    'ad_group_criterion.keyword.text, ad_group_criterion.keyword.match_type ' +
-    'FROM keyword_view ' +
-    'WHERE campaign.id IN (' + CAMPAIGN_IDS.join(', ') + ') ' +
-    'AND ad_group_criterion.negative = FALSE ' +
-    'AND ' + statusCondition('campaign.status', CAMPAIGN_STATUS) + ' ' +
-    'AND ' + statusCondition('ad_group.status', ADGROUP_STATUS) + ' ' +
-    'AND ' + statusCondition('ad_group_criterion.status', KEYWORD_STATUS));
-
-  while (rows.hasNext()) {
-    const row = rows.next();
-    if (!nameContains(row.adGroup.name, SOURCE_ADGROUP_CONTAINS)) continue;
-
-    const matchType = row.adGroupCriterion.keyword.matchType;
-    const text = cleanText(row.adGroupCriterion.keyword.text, matchType);
-    const campaignId = String(row.campaign.id);
-    const key = keyOf(text, matchType);
-
-    byCampaign[campaignId] = byCampaign[campaignId] || {};
-    if (!byCampaign[campaignId][key]) {
-      byCampaign[campaignId][key] = { text: text, matchType: matchType };
-    }
-    count++;
+// Returns true if the ad group name contains one of the exclude strings (case-insensitive)
+function isExcluded(adGroupName) {
+  var lower = String(adGroupName).toLowerCase();
+  for (var i = 0; i < EXCLUDE_ADGROUP_CONTAINS.length; i++) {
+    if (lower.indexOf(EXCLUDE_ADGROUP_CONTAINS[i].toLowerCase()) !== -1) return true;
   }
-  return { byCampaign: byCampaign, count: count };
+  return false;
 }
 
+// Normalizes keyword text so the duplicate check works reliably
+function normalizeText(text) {
+  return String(text || '')
+    .toLowerCase()          // case-insensitive comparison
+    .replace(/\+/g, '')     // remove legacy BMM "+" signs
+    .replace(/\s+/g, ' ')   // collapse multiple spaces
+    .trim();                // remove leading/trailing spaces
+}
 
-// Enabled and paused target ad groups in campaigns that have source keywords
-function getTargetAdGroups(sourceByCampaign) {
-  const targets = [];
-
-  const rows = AdsApp.search(
-    'SELECT campaign.id, ad_group.id, ad_group.name, ad_group.resource_name ' +
-    'FROM ad_group ' +
-    'WHERE campaign.id IN (' + CAMPAIGN_IDS.join(', ') + ') ' +
-    "AND ad_group.status != 'REMOVED'");
-
-  while (rows.hasNext()) {
-    const row = rows.next();
-    const campaignId = String(row.campaign.id);
-    const name = row.adGroup.name;
-    if (!sourceByCampaign[campaignId] || !nameContains(name, TARGET_ADGROUP_CONTAINS)) continue;
-
-    // Safety: never add negatives to an ad group that is itself a source ad group
-    if (nameContains(name, SOURCE_ADGROUP_CONTAINS)) {
-      Logger.log('Übersprungen (Name enthält "' + SOURCE_ADGROUP_CONTAINS + '" und "' +
-        TARGET_ADGROUP_CONTAINS + '"): ' + name);
-      continue;
-    }
-    targets.push({
-      id: String(row.adGroup.id),
-      name: name,
-      campaignId: campaignId,
-      resourceName: row.adGroup.resourceName
-    });
+// Sends the alert mail (max. 50 error lines, rest is in the script log)
+function sendErrorMail(errors) {
+  var account = AdsApp.currentAccount();
+  var maxLines = 50;
+  var lines = errors.slice(0, maxLines);
+  if (errors.length > maxLines) {
+    lines.push('... and ' + (errors.length - maxLines) + ' more errors (see script log).');
   }
-  return targets;
-}
 
+  var body =
+    'Script: ' + SCRIPT_NAME + '\n' +
+    'Account: ' + ACCOUNT_LABEL + ' (' + account.getCustomerId() + ')\n' +
+    'Time: ' + Utilities.formatDate(new Date(), account.getTimeZone(), 'yyyy-MM-dd HH:mm:ss') + '\n\n' +
+    'Errors:\n' + lines.join('\n');
 
-// Returns { adGroupId: { key: true } } for every target ad group
-function getExistingNegatives(targets) {
-  const existing = {};
-  if (targets.length === 0) return existing;
-  targets.forEach(function (adGroup) { existing[adGroup.id] = {}; });
-
-  const rows = AdsApp.search(
-    'SELECT ad_group.id, ad_group_criterion.keyword.text, ad_group_criterion.keyword.match_type ' +
-    'FROM ad_group_criterion ' +
-    'WHERE ad_group.id IN (' + Object.keys(existing).join(', ') + ') ' +
-    "AND ad_group_criterion.type = 'KEYWORD' " +
-    'AND ad_group_criterion.negative = TRUE ' +
-    "AND ad_group_criterion.status != 'REMOVED'");
-
-  while (rows.hasNext()) {
-    const row = rows.next();
-    const keyword = row.adGroupCriterion.keyword;
-    existing[String(row.adGroup.id)][keyOf(keyword.text, keyword.matchType)] = true;
-  }
-  return existing;
-}
-
-
-// Creates the negatives in batches. Returns one entry per planned negative:
-// null if it was created, otherwise the error message.
-function createNegatives(planned) {
-  let errors = [];
-  for (let start = 0; start < planned.length; start += MUTATE_BATCH_SIZE) {
-    const batch = planned.slice(start, start + MUTATE_BATCH_SIZE);
-    const operations = batch.map(function (p) {
-      return {
-        adGroupCriterionOperation: {
-          create: {
-            adGroup: p.adGroup.resourceName,
-            negative: true,
-            keyword: { text: p.keyword.text, matchType: p.keyword.matchType }
-          }
-        }
-      };
-    });
-    const results = AdsApp.mutateAll(operations, { partialFailure: true });
-    errors = errors.concat(results.map(function (result) {
-      return result.isSuccessful() ? null : result.getErrorMessages().join('; ');
-    }));
-  }
-  return errors;
-}
-
-
-// --------------------------------------------------------------------
-// Helpers
-// --------------------------------------------------------------------
-
-function validateConfig() {
-  const statuses = {
-    CAMPAIGN_STATUS: CAMPAIGN_STATUS,
-    ADGROUP_STATUS: ADGROUP_STATUS,
-    KEYWORD_STATUS: KEYWORD_STATUS
-  };
-  Object.keys(statuses).forEach(function (name) {
-    if (['', 'ENABLED', 'PAUSED'].indexOf(statuses[name]) === -1) {
-      throw new Error('Ungültiger Wert für ' + name + ': "' + statuses[name] +
-        '" (erlaubt: \'ENABLED\', \'PAUSED\' oder \'\')');
-    }
-  });
-  if (CAMPAIGN_IDS.length === 0 ||
-      CAMPAIGN_IDS.some(function (id) { return !/^\d+$/.test(String(id)); })) {
-    throw new Error('Ungültige CAMPAIGN_IDS: ' + CAMPAIGN_IDS.join(', '));
-  }
-  if (!SOURCE_ADGROUP_CONTAINS || !TARGET_ADGROUP_CONTAINS) {
-    throw new Error('SOURCE_ADGROUP_CONTAINS und TARGET_ADGROUP_CONTAINS dürfen nicht leer sein.');
-  }
-}
-
-// '' = any status except REMOVED
-function statusCondition(field, status) {
-  return status ? field + " = '" + status + "'" : field + " != 'REMOVED'";
-}
-
-function nameContains(name, part) {
-  return String(name).toLowerCase().indexOf(String(part).toLowerCase()) !== -1;
-}
-
-// Normalises spacing. For broad match the legacy "+" modifier is dropped
-// (a broad negative already requires all of its words).
-function cleanText(text, matchType) {
-  const clean = String(text).trim().replace(/\s+/g, ' ');
-  return matchType === 'BROAD' ? clean.replace(/(^| )\+/g, '$1') : clean;
-}
-
-// Duplicate check: same match type + same text (not case-sensitive)
-function keyOf(text, matchType) {
-  return matchType + '|' + cleanText(text, matchType).toLowerCase();
-}
-
-function formatKeyword(keyword) {
-  if (keyword.matchType === 'EXACT') return '[' + keyword.text + ']';
-  if (keyword.matchType === 'PHRASE') return '"' + keyword.text + '"';
-  return keyword.text;
-}
-
-function sendErrorMail(error) {
-  try {
-    const account = AdsApp.currentAccount();
-    const time = Utilities.formatDate(new Date(), account.getTimeZone(), 'dd.MM.yyyy HH:mm:ss');
-    const message = (error && error.message) ? error.message : String(error);
-    MailApp.sendEmail(ERROR_EMAIL, ERROR_SUBJECT,
-      'Das Script "' + SCRIPT_NAME + '" ist fehlgeschlagen.\n\n' +
-      'Konto: ' + ACCOUNT_LABEL + ' (' + account.getCustomerId() + ')\n' +
-      'Zeitpunkt: ' + time + '\n\n' +
-      'Fehler:\n' + message);
-  } catch (mailError) {
-    Logger.log('Fehlermail konnte nicht gesendet werden: ' + mailError);
-  }
+  MailApp.sendEmail(ERROR_EMAIL, ERROR_SUBJECT, body);
 }
