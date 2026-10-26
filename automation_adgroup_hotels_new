@@ -1,0 +1,479 @@
+"""legt neue Adgroups im DERTOUR-Konto an.
+
+Auftragsliste ist die BigQuery-View
+sea_automation_prod.dertour_adgroup-sync_new-adgroups
+mit den Feldern giata_id, reason, ad_group_name, campaign_name.
+Blacklist-Hotels sind dort bereits herausgefiltert.
+
+Texte, final_url und hotel_name kommen aus dem Channable-Feed
+stammdaten.dertour_channable_export-feed (Join ueber giata_id).
+ad_group_name und campaign_name kommen aus der Auftrags-View.
+Leere Namen, fehlende Feed-Daten und bereits bestehende Adgroups
+filtert die Auftrags-View heraus.
+
+Die Zielkampagne muss im Konto bereits existieren (aktiviert oder pausiert)
+-- sonst wird die Adgroup uebersprungen und beim naechsten Run erneut versucht.
+ein backup ist ebenfalls in der Auftrags-View hinterlegt
+
+Im AI-Max-Setting der Adgroup ist der Suchanfragen-Abgleich deaktiviert.
+
+Je Adgroup entstehen zwei Responsive Search Ads. Ihre Texte stehen in
+ads_config.py. Nichts wird gepinnt.
+
+Jede angelegte Adgroup wird im Google Sheet protokolliert:
+giata_id, datum, campaign_name, ad_group_name, hotel_name, reason.
+"""
+
+import os
+from datetime import datetime
+from zoneinfo import ZoneInfo
+
+import functions_framework
+import google.auth
+from google.cloud import bigquery
+from google.ads.googleads.client import GoogleAdsClient
+from google.ads.googleads.errors import GoogleAdsException
+from googleapiclient.discovery import build
+
+from ads_config import Col, build_ads
+
+# --- Configuration ---------------------------------------------------
+PROJECT_ID = "dt-dertour-digital-marketing"
+# Order list: which ad groups should be created
+ORDER_VIEW = f"{PROJECT_ID}.sea_automation_prod.dertour_adgroup-sync_new-adgroups"
+# Channable feed with the master data (texts, URLs, hotel name)
+FEED = f"{PROJECT_ID}.stammdaten.dertour_channable_export-feed"
+
+# ID of the single account (not the MCC), digits only without dashes
+CUSTOMER_ID = os.environ.get("DT_CUSTOMER_ID", "8009023176")
+
+# Labels: one on the ad group, one per ad
+ADGROUP_LABEL_ID = "22281206059"
+AD_1_LABEL_ID = "21883673230"
+AD_2_LABEL_ID = "21806428823"
+
+# DRY_RUN=true  -> nothing is created, candidates are only validated (default, safe)
+# DRY_RUN=false -> ad groups are actually created in the Google Ads account
+DRY_RUN = os.environ.get("DRY_RUN", "true").lower() != "false"
+
+# Upper bound per run: caps runtime and limits the blast radius of a bad feed.
+# Leftovers are picked up by the next run.
+MAX_CREATIONS = int(os.environ.get("MAX_CREATIONS", "10"))
+
+# Google Sheet "dertour_logs"
+SHEET_ID = "1midwBxOMScvRh-cs-vFHe9wJ3HTyh1ezrvrggoUGJMw"
+# Live: every created ad group is appended here
+SHEET_TAB_CREATED = os.environ.get("SHEET_TAB_CREATED", "adgroups_created")
+# Dry run: validated ad groups are appended here
+SHEET_TAB_CREATED_DRY_RUN = os.environ.get(
+    "SHEET_TAB_CREATED_DRY_RUN", "adgroups_created_test"
+)
+
+# Google Sheet-backed BigQuery tables need the Drive scope in addition to BigQuery
+SCOPES = [
+    "https://www.googleapis.com/auth/drive",
+    "https://www.googleapis.com/auth/cloud-platform",
+]
+
+# Writing the sheet needs the Sheets scope
+SHEET_SCOPES = ["https://www.googleapis.com/auth/spreadsheets"]
+
+# Keyword match types created for the hotel name
+MATCH_TYPES = ("EXACT", "BROAD")
+
+# API limits for a responsive search ad
+MAX_HEADLINES = 15
+MAX_DESCRIPTIONS = 4
+MIN_HEADLINES = 3
+MIN_DESCRIPTIONS = 2
+
+# Ad texts live in ads_config.py
+ADS = build_ads(AD_1_LABEL_ID, AD_2_LABEL_ID)
+
+# Lookup used when the labels are applied after creation
+AD_LABEL_BY_NAME = {spec["name"]: spec["label_id"] for spec in ADS}
+
+
+def sheets_service():
+    credentials, _ = google.auth.default(scopes=SHEET_SCOPES)
+    return build("sheets", "v4", credentials=credentials)
+
+
+def get_orders():
+    # All rows of the order view, enriched with the feed data.
+    # ad_group_name and campaign_name come from the order view, everything
+    # else (texts, final_url, hotel_name) from the feed. The view already
+    # guarantees that feed data exists for every order.
+    credentials, _ = google.auth.default(scopes=SCOPES)
+    client = bigquery.Client(project=PROJECT_ID, credentials=credentials)
+    query = f"""
+        SELECT
+          o.giata_id,
+          o.reason,
+          o.ad_group_name,
+          o.campaign_name,
+          f.* EXCEPT (giata_id, ad_group_name, campaign_name)
+        FROM `{ORDER_VIEW}` AS o
+        LEFT JOIN `{FEED}` AS f
+          ON CAST(f.giata_id AS STRING) = CAST(o.giata_id AS STRING)
+        ORDER BY o.giata_id
+    """
+    return list(client.query(query).result())
+
+
+def build_ads_client():
+    # Build the Google Ads client from the secrets (provided as env variables)
+    config = {
+        "developer_token": os.environ["GOOGLE_ADS_DEVELOPER_TOKEN"],
+        "client_id": os.environ["GOOGLE_ADS_CLIENT_ID"],
+        "client_secret": os.environ["GOOGLE_ADS_CLIENT_SECRET"],
+        "refresh_token": os.environ["GOOGLE_ADS_REFRESH_TOKEN"],
+        "login_customer_id": os.environ["GOOGLE_ADS_LOGIN_CUSTOMER_ID"],
+        "use_proto_plus": True,
+    }
+    return GoogleAdsClient.load_from_dict(config)
+
+
+def get_campaigns(ads_client):
+    # All enabled or paused search campaigns of the account: name -> [ids].
+    # A list, so a name that exists twice can be detected and skipped.
+    service = ads_client.get_service("GoogleAdsService")
+    query = """
+        SELECT campaign.id, campaign.name
+        FROM campaign
+        WHERE campaign.status IN ('ENABLED', 'PAUSED')
+          AND campaign.advertising_channel_type = 'SEARCH'
+    """
+    campaigns = {}
+    for batch in service.search_stream(customer_id=CUSTOMER_ID, query=query):
+        for row in batch.results:
+            campaigns.setdefault(row.campaign.name, []).append(row.campaign.id)
+    return campaigns
+
+
+def field(row, name):
+    # Read a column as stripped text; missing or empty -> ""
+    value = row.get(name)
+    return str(value).strip() if value is not None else ""
+
+
+def text_asset(ads_client, text):
+    # Wrap a plain string into an AdTextAsset for the responsive search ad
+    asset = ads_client.get_type("AdTextAsset")
+    asset.text = text
+    return asset
+
+
+def resolve(row, item):
+    # Turn one entry of an ad definition into text: Col -> value from the row,
+    # anything else stays as written. Empty values become None and are dropped.
+    if item is None:
+        return None
+    value = getattr(row, item.name, None) if isinstance(item, Col) else item
+    if value is None:
+        return None
+    value = str(value).strip()
+    return value or None
+
+
+def dedupe(texts):
+    # Derselbe Text darf innerhalb einer Anzeige nur einmal vorkommen
+    seen, out = set(), []
+    for text in texts:
+        key = text.casefold()
+        if key not in seen:
+            seen.add(key)
+            out.append(text)
+    return out
+
+
+def build_ad_operation(ads_client, row, spec, ad_group_ref):
+    # One responsive search ad. Returns None when the feed does not provide
+    # enough text -- that ad is skipped instead of failing the whole hotel.
+    headlines = dedupe([t for t in (resolve(row, i) for i in spec["headlines"]) if t])
+    descriptions = dedupe(
+        [t for t in (resolve(row, i) for i in spec["descriptions"]) if t]
+    )
+
+    if len(headlines) < MIN_HEADLINES or len(descriptions) < MIN_DESCRIPTIONS:
+        return None
+
+    op = ads_client.get_type("MutateOperation")
+    ad_group_ad = op.ad_group_ad_operation.create
+    ad_group_ad.ad_group = ad_group_ref
+    ad_group_ad.status = ads_client.enums.AdGroupAdStatusEnum.ENABLED
+    ad_group_ad.ad.final_urls.append(field(row, "final_url"))
+
+    rsa = ad_group_ad.ad.responsive_search_ad
+    rsa.headlines.extend(
+        text_asset(ads_client, t) for t in headlines[:MAX_HEADLINES]
+    )
+    rsa.descriptions.extend(
+        text_asset(ads_client, t) for t in descriptions[:MAX_DESCRIPTIONS]
+    )
+
+    # path2 is only allowed together with path1
+    path1 = resolve(row, spec.get("path1"))
+    path2 = resolve(row, spec.get("path2"))
+    if path1:
+        rsa.path1 = path1
+        if path2:
+            rsa.path2 = path2
+
+    return op
+
+
+def build_base_operations(ads_client, row, campaign_id, temp_ad_group):
+    # Ad group, both keywords and the ad group label -- everything that is
+    # created exactly once per hotel.
+    campaign_service = ads_client.get_service("CampaignService")
+    label_service = ads_client.get_service("LabelService")
+    operations = []
+
+    # Paused on purpose. No cpc bid: the campaign bidding strategy applies.
+    op = ads_client.get_type("MutateOperation")
+    ad_group = op.ad_group_operation.create
+    ad_group.resource_name = temp_ad_group
+    ad_group.name = field(row, "ad_group_name")
+    ad_group.campaign = campaign_service.campaign_path(CUSTOMER_ID, campaign_id)
+    ad_group.status = ads_client.enums.AdGroupStatusEnum.PAUSED
+    ad_group.type_ = ads_client.enums.AdGroupTypeEnum.SEARCH_STANDARD
+    # AI Max: search term matching ("Suchanfragen-Abgleich") off for this ad group
+    ad_group.ai_max_ad_group_setting.disable_search_term_matching = True
+    operations.append(op)
+
+    # The hotel name as keyword, once per match type.
+    # The API takes the raw text -- no brackets or quotes.
+    for match_type in MATCH_TYPES:
+        op = ads_client.get_type("MutateOperation")
+        criterion = op.ad_group_criterion_operation.create
+        criterion.ad_group = temp_ad_group
+        criterion.status = ads_client.enums.AdGroupCriterionStatusEnum.ENABLED
+        criterion.keyword.text = field(row, "hotel_name")
+        criterion.keyword.match_type = getattr(
+            ads_client.enums.KeywordMatchTypeEnum, match_type
+        )
+        operations.append(op)
+
+    op = ads_client.get_type("MutateOperation")
+    ad_group_label = op.ad_group_label_operation.create
+    ad_group_label.ad_group = temp_ad_group
+    ad_group_label.label = label_service.label_path(CUSTOMER_ID, ADGROUP_LABEL_ID)
+    operations.append(op)
+
+    return operations
+
+
+def mutate(ads_client, operations, validate_only=False):
+    service = ads_client.get_service("GoogleAdsService")
+    request = ads_client.get_type("MutateGoogleAdsRequest")
+    request.customer_id = CUSTOMER_ID
+    request.mutate_operations.extend(operations)
+    request.validate_only = validate_only
+    return service.mutate(request=request)
+
+
+def buildable_specs(ads_client, row, temp_ad_group):
+    # Which of the ads have enough text for this hotel?
+    specs = []
+    for spec in ADS:
+        if build_ad_operation(ads_client, row, spec, temp_ad_group) is None:
+            print(
+                f"[WARN] {spec['name']} skipped for giata {row.giata_id} "
+                "-- too few texts"
+            )
+        else:
+            specs.append(spec)
+    return specs
+
+
+def create_ad_group(ads_client, row, campaign_id, validate_only=False):
+    # The ads go out in separate requests on purpose: Google Ads rejects the
+    # same text asset twice within one request (AssetError.DUPLICATE_ASSET),
+    # which happens as soon as both ads share a headline.
+    ad_group_service = ads_client.get_service("AdGroupService")
+    temp_ad_group = ad_group_service.ad_group_path(CUSTOMER_ID, -1)
+
+    specs = buildable_specs(ads_client, row, temp_ad_group)
+    if not specs:
+        raise ValueError("no ad could be built from the feed data")
+
+    if validate_only:
+        # One self-contained request per ad, so every ad is really checked.
+        # Nothing is written, so repeating the ad group costs nothing.
+        for spec in specs:
+            operations = build_base_operations(ads_client, row, campaign_id, temp_ad_group)
+            operations.append(
+                build_ad_operation(ads_client, row, spec, temp_ad_group)
+            )
+            mutate(ads_client, operations, validate_only=True)
+        return []
+
+    # Request 1: ad group, keywords, ad group label and the first ad.
+    # Atomic -- an ad group without a single ad would be useless.
+    operations = build_base_operations(ads_client, row, campaign_id, temp_ad_group)
+    operations.append(build_ad_operation(ads_client, row, specs[0], temp_ad_group))
+    response = mutate(ads_client, operations)
+
+    results = response.mutate_operation_responses
+    ad_group_resource = results[0].ad_group_result.resource_name
+    created_ads = [(specs[0]["name"], results[-1].ad_group_ad_result.resource_name)]
+
+    # One request per remaining ad, now against the real ad group.
+    # A failure here costs that one ad, not the whole hotel.
+    for spec in specs[1:]:
+        try:
+            op = build_ad_operation(ads_client, row, spec, ad_group_resource)
+            result = mutate(ads_client, [op])
+            created_ads.append(
+                (
+                    spec["name"],
+                    result.mutate_operation_responses[0].ad_group_ad_result.resource_name,
+                )
+            )
+        except GoogleAdsException as error:
+            details = "; ".join(e.message for e in error.failure.errors)
+            print(f"[WARN] {spec['name']} failed for giata {row.giata_id} | {details}")
+        except Exception as error:
+            print(f"[WARN] {spec['name']} failed for giata {row.giata_id} | {error}")
+
+    return created_ads
+
+
+def apply_ad_labels(ads_client, created_ads):
+    # Second step: label every created ad with its own label. The resource
+    # names only exist once the ads have been written.
+    if not created_ads:
+        return
+    label_service = ads_client.get_service("LabelService")
+    operations = []
+    for name, resource_name in created_ads:
+        op = ads_client.get_type("MutateOperation")
+        ad_label = op.ad_group_ad_label_operation.create
+        ad_label.ad_group_ad = resource_name
+        ad_label.label = label_service.label_path(CUSTOMER_ID, AD_LABEL_BY_NAME[name])
+        operations.append(op)
+    mutate(ads_client, operations)
+
+
+def append_rows(service, tab, rows):
+    # Append to a log tab: giata_id, datum, campaign, ad group, hotel, reason
+    service.spreadsheets().values().append(
+        spreadsheetId=SHEET_ID,
+        range=f"{tab}!A:F",
+        valueInputOption="USER_ENTERED",
+        insertDataOption="INSERT_ROWS",
+        body={"values": rows},
+    ).execute()
+
+
+@functions_framework.http
+def create_adgroups(request):
+    # Entry point: read the order view, create what is missing in the account
+    orders = get_orders()
+    print(f"{len(orders)} order(s) in the view. DRY_RUN={DRY_RUN}")
+
+    if not orders:
+        return "Finished. Nothing to create.", 200
+
+    # Built even in a dry run -- the campaign lookup reads from the account
+    ads_client = build_ads_client()
+    campaigns = get_campaigns(ads_client)
+    print(f"{len(campaigns)} campaign name(s) in account {CUSTOMER_ID}.")
+
+    today = datetime.now(ZoneInfo("Europe/Berlin")).strftime("%d/%m/%Y")
+    log_rows = []    # live: rows for the created tab
+    dry_run_rows = []  # dry run: rows for the test tab
+    created = 0
+    checked = 0      # nur im Dry Run: geprueft, aber nicht angelegt
+    no_campaign = 0  # Kampagne nicht gefunden oder Name nicht eindeutig
+    failed = 0
+
+    for row in orders:
+        if created + checked + failed >= MAX_CREATIONS:
+            print(f"Limit of {MAX_CREATIONS} reached, rest waits for the next run.")
+            break
+
+        giata = row.giata_id
+        campaign_name = field(row, "campaign_name")
+        ad_group_name = field(row, "ad_group_name")
+        hotel_name = field(row, "hotel_name")
+        reason = field(row, "reason")
+
+        # Campaign must exist (enabled or paused) and its name must be unique
+        campaign_ids = campaigns.get(campaign_name, [])
+        if len(campaign_ids) != 1:
+            no_campaign += 1
+            why = "not found" if not campaign_ids else "name not unique"
+            print(f"[SKIP] campaign {why} -> '{campaign_name}' | {ad_group_name}")
+            continue
+        campaign_id = campaign_ids[0]
+
+        info = f"giata {giata} -> {campaign_name} | {ad_group_name}"
+        log_row = [giata, today, campaign_name, ad_group_name, hotel_name, reason]
+
+        if DRY_RUN:
+            # Full server-side check of ad group, keywords and both ads --
+            # without writing anything to the account. The labels on the ads
+            # cannot be checked here: they need resource names that only exist
+            # after a real creation.
+            try:
+                create_ad_group(ads_client, row, campaign_id, validate_only=True)
+                checked += 1
+                print(f"[DRY_RUN] valid, would create -> {info}")
+                dry_run_rows.append(log_row)
+            except GoogleAdsException as error:
+                failed += 1
+                details = "; ".join(e.message for e in error.failure.errors)
+                print(f"[DRY_RUN] WOULD FAIL -> {info} | {details}")
+            except Exception as error:
+                failed += 1
+                print(f"[DRY_RUN] WOULD FAIL -> {info} | {error}")
+            continue
+
+        try:
+            created_ads = create_ad_group(ads_client, row, campaign_id)
+            created += 1
+            print(f"[LIVE] created -> {info}")
+            log_rows.append(log_row)
+
+            # Labels on the ads. A failure here leaves the ads in place and
+            # only costs the label, so it must not count as a failed creation.
+            try:
+                apply_ad_labels(ads_client, created_ads)
+            except Exception as error:
+                print(f"[WARN] ad labels failed -> {info} | {error}")
+
+        except GoogleAdsException as error:
+            failed += 1
+            details = "; ".join(e.message for e in error.failure.errors)
+            print(f"[ERROR] failed -> {info} | {details}")
+        except Exception as error:
+            failed += 1
+            print(f"[ERROR] failed -> {info} | {error}")
+
+    # A failing sheet must not fail the whole run -- the ad groups already exist
+    try:
+        if log_rows or dry_run_rows:
+            sheets = sheets_service()
+            if log_rows:
+                append_rows(sheets, SHEET_TAB_CREATED, log_rows)
+                print(f"Sheet tab '{SHEET_TAB_CREATED}' updated, {len(log_rows)} row(s).")
+            if dry_run_rows:
+                append_rows(sheets, SHEET_TAB_CREATED_DRY_RUN, dry_run_rows)
+                print(
+                    f"Sheet tab '{SHEET_TAB_CREATED_DRY_RUN}' updated, "
+                    f"{len(dry_run_rows)} row(s)."
+                )
+    except Exception as error:
+        print(f"[ERROR] sheet update failed | {error}")
+
+    msg = (
+        f"Finished. {len(orders)} ordered, {created} created, {checked} checked, "
+        f"{no_campaign} without campaign, {failed} failed (DRY_RUN={DRY_RUN})."
+    )
+    print(msg)
+
+    # Always 200, even after single failures: they are logged per hotel and a
+    # non-2xx would let Cloud Scheduler retry the whole run.
+    return msg, 200
